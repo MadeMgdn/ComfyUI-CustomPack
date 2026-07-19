@@ -1,0 +1,8 @@
+CV2
+PIL
+numpy
+requests>=2.31.0
+scipy
+torch
+torchvision
+trimesh
