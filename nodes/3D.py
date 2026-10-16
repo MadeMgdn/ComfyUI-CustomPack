@@ -1,5 +1,6 @@
 import torch
-import trimesh
+import pynanoinstantmeshes as PyNIM
+import trimesh as trimesh_lib
 from trimesh.grouping import merge_vertices, group_rows
 from trimesh.constants import tol
 import numpy as np
@@ -47,7 +48,7 @@ class CP_MeshToTrimesh:
         if f_np.ndim == 3 and f_np.shape[0] == 1:
             f_np = f_np[0]
 
-        trimesh_obj = trimesh.Trimesh(vertices=v_np, faces=f_np, process=False)
+        trimesh_obj = trimesh_lib.Trimesh(vertices=v_np, faces=f_np, process=False)
 
         return (trimesh_obj,)
 
@@ -87,11 +88,6 @@ class CP_TrimeshWeldVertex:
     DESCRIPTION = "Welds vertices within threshold using scaling for numerical stability."
 
     def weld(self, trimesh, threshold, scale_factor, merge_tex, merge_norm, digits_vertex, digits_norm, digits_uv):
-        try:
-            import trimesh as trimesh_lib
-        except ImportError:
-            raise ImportError("trimesh library not found. Please install it using 'pip install trimesh'")
-
         vertices_before = len(trimesh.vertices)
         new_mesh = trimesh.copy()
 
@@ -147,11 +143,6 @@ class CP_STLCheck:
     )
 
     def check_mesh(self, trimesh):
-        try:
-            import trimesh as trimesh_lib
-        except ImportError:
-            raise ImportError("trimesh library not found. Please install it using 'pip install trimesh'")
-
         mesh = trimesh.copy()
         
         open_edges_count = 0
@@ -234,13 +225,6 @@ class CP_QuadRemesh:
     DESCRIPTION = "Quad remeshing using Instant Meshes (4-rosy/4-posy field)."
 
     def quad_remesh(self, trimesh, face_count, smooth_iter, align_to_boundaries, crease_angle, smooth_normals):
-        try:
-            import pynanoinstantmeshes as PyNIM
-        except ImportError:
-            raise ImportError("pynanoinstantmeshes not found. Install: pip install pynanoinstantmeshes")
-        
-        import trimesh as trimesh_lib
-
         face_count_before = len(trimesh.faces)
         target_vertex_count = max(4, int(face_count * 0.9))
 
@@ -276,8 +260,7 @@ class CP_QuadRemesh:
             elif isinstance(good_faces, np.ndarray) and good_faces.dtype in (np.int32, np.int64):
                 mesh.faces = mesh.faces[good_faces]
         else:
-            from trimesh.geometry import area
-            face_areas = area(mesh.vertices, mesh.faces)
+            face_areas = mesh.area_faces
             mesh.update_faces(face_areas > 1e-8)
 
         if smooth_normals:              

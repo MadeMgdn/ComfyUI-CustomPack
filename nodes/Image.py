@@ -1,6 +1,10 @@
 from __future__ import annotations
 from PIL import Image, ImageOps, ImageDraw, ImageFont, ImageColor
+from comfy import model_management
+from comfy import utils as comfy_utils
+from comfy.cli_args import args as comfy_args
 import numpy as np
+import kornia
 import torch
 import torchvision.transforms.functional as TF
 import io
@@ -14,16 +18,6 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 from nodes import SaveImage
 from PIL.PngImagePlugin import PngInfo
-
-try:
-    import folder_paths
-except Exception:
-    folder_paths = None
-
-try:
-    from comfy.cli_args import args as comfy_args
-except Exception:
-    comfy_args = None
 
 categoryFolder = "Custom pack/Image"
 
@@ -1410,9 +1404,6 @@ class CP_ColorTransfer:
 
     @staticmethod
     def _get_runtime(image_target):
-        from comfy import model_management
-        from comfy import utils as comfy_utils
-
         device = model_management.get_torch_device()
         intermediate_device = model_management.intermediate_device()
         intermediate_dtype_fn = getattr(model_management, "intermediate_dtype", None)
@@ -1425,10 +1416,6 @@ class CP_ColorTransfer:
 
     @staticmethod
     def _try_kornia_color():
-        try:
-            import kornia
-        except ImportError:
-            return None
         return kornia.color
 
     @staticmethod

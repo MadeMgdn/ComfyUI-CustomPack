@@ -8,14 +8,9 @@ from typing import Any
 
 import numpy as np
 import torch
+from aiohttp import web
 from PIL import Image
-
-try:
-    from aiohttp import web
-    from server import PromptServer
-except Exception:
-    web = None
-    PromptServer = None
+from server import PromptServer
 
 
 categoryFolder = "Custom pack/Web"

@@ -22,6 +22,8 @@ class Colors:
     UNDERLINE = "\033[4m"
 
 def load_nodes_recursive(nodes_dir):
+    global flag
+
     if not os.path.exists(nodes_dir):
         return
     

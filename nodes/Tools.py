@@ -1,17 +1,17 @@
 from __future__ import annotations
+import ast
+import json
 import os
+import operator as op
+import random
 import folder_paths
 from datetime import datetime
 import torch
-from typing import List, Dict, Any, Optional
 from PIL import Image, ImageDraw, ImageFont
 import re
 import numpy as np
 import math
 import glob
-from typing import Any
-import requests
-import threading
 
 categoryFolder = "Custom pack/Tools"
 
@@ -880,695 +880,6 @@ class CP_BatchImageWatermarkText:
         result_str = "\n".join(saved_paths)
         return (result_str,)
 
-#Transfer token prompt into natural language prompt
-DEFAULT_SYSTEM_PROMPT = """You convert tokenized image prompts into natural language prompts for FLUX and Z-Image models.
-Rules:
-1. Preserve all important visual details, style words, camera hints, lighting, composition, quality markers, and negative constraints.
-2. Expand shorthand tokens into clear natural language.
-3. Remove duplicates and obvious contradictions.
-4. Return only prompt text in English, without meta-commentary."""
-
-OUTPUT_TEMPLATE_DEFAULT = "default"
-OUTPUT_TEMPLATE_ZIMAGE_STRUCT = "z-image struct"
-LLM_DEVICE_GPU = "gpu"
-LLM_DEVICE_CPU = "cpu"
-MODEL_RESIDENCY_KEEP = "keep_loaded"
-MODEL_RESIDENCY_UNLOAD = "unload_after_run"
-MODEL_RESIDENCY_FULL_UNLOAD = "full_unload"
-RAM_KEEPER_CONTEXT_SIZE = 512
-
-STRUCT_SECTION_ORDER = (
-    "Subject",
-    "Scene",
-    "Composition",
-    "Lighting",
-    "Style",
-    "Constraints",
-)
-TOKEN_COVERAGE_RETRY_ROUNDS = 1
-MAX_MISSING_TOKEN_INJECTION = 24
-
-
-class CP_LocalLLMTokenPromptToNatural:
-    _llama_cache: dict[tuple[str, int, int], Any] = {}
-    _ram_keeper_keys: set[tuple[str, int, int]] = set()
-    _cache_lock = threading.Lock()
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "token_prompt": ("STRING", {"multiline": True, "default": ""}),
-                "output_template": (
-                    [OUTPUT_TEMPLATE_DEFAULT, OUTPUT_TEMPLATE_ZIMAGE_STRUCT],
-                    {"default": OUTPUT_TEMPLATE_DEFAULT},
-                ),
-                "backend": (["ollama", "llama_cpp"], {"default": "ollama"}),
-                "model_name": ("STRING", {"default": "llama3.1:8b-instruct-q4_K_M"}),
-                "endpoint": ("STRING", {"default": "http://127.0.0.1:11434"}),
-                "model_path": ("STRING", {"default": ""}),
-                "llm_device": ([LLM_DEVICE_GPU, LLM_DEVICE_CPU], {"default": LLM_DEVICE_GPU}),
-                "model_residency": (
-                    [MODEL_RESIDENCY_KEEP, MODEL_RESIDENCY_UNLOAD, MODEL_RESIDENCY_FULL_UNLOAD],
-                    {"default": MODEL_RESIDENCY_KEEP},
-                ),
-                "temperature": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 2.0, "step": 0.01}),
-                "top_p": ("FLOAT", {"default": 0.95, "min": 0.05, "max": 1.0, "step": 0.01}),
-                "max_tokens": ("INT", {"default": 220, "min": 16, "max": 2048, "step": 1}),
-                "seed": ("INT", {"default": 42, "min": -1, "max": 2147483647, "step": 1}),
-                "timeout_sec": ("INT", {"default": 120, "min": 5, "max": 600, "step": 1}),
-                "context_size": ("INT", {"default": 4096, "min": 512, "max": 32768, "step": 256}),
-                "gpu_layers": ("INT", {"default": -1, "min": -1, "max": 200, "step": 1}),
-                "system_prompt": ("STRING", {"multiline": True, "default": DEFAULT_SYSTEM_PROMPT}),
-            }
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("natural_prompt",)
-    FUNCTION = "convert"
-    CATEGORY = "text/llm"
-
-    @staticmethod
-    def _build_user_prompt(token_prompt: str, output_template: str, token_checklist: list[str]) -> str:
-        checklist_block = ""
-        if token_checklist:
-            checklist_lines = [f"{idx}. {token}" for idx, token in enumerate(token_checklist, start=1)]
-            checklist_block = (
-                "\nMandatory token checklist (do not drop any item, keep semantics explicit):\n"
-                + "\n".join(checklist_lines)
-            )
-
-        if output_template == OUTPUT_TEMPLATE_ZIMAGE_STRUCT:
-            return (
-                "Rewrite the token prompt below into a natural language prompt for text-to-image generation.\n"
-                "You must preserve all token semantics from the checklist.\n"
-                "Return the answer in English and in this exact structure (all six items are mandatory):\n"
-                "1. Subject: ...\n"
-                "2. Scene: ...\n"
-                "3. Composition: ...\n"
-                "4. Lighting: ...\n"
-                "5. Style: ...\n"
-                "6. Constraints: ...\n"
-                "If any item is unknown, write: not specified.\n\n"
-                f"Token prompt:\n{token_prompt}{checklist_block}"
-            )
-        return (
-            "Rewrite the token prompt below into a fluent natural language prompt for text-to-image generation.\n"
-            "Do not omit any relevant token concept; use as many sentences as needed for full coverage.\n"
-            "Return only the final prompt text in English.\n\n"
-            f"Token prompt:\n{token_prompt}{checklist_block}"
-        )
-
-    @staticmethod
-    def _clean_output(text: str, preserve_newlines: bool = False) -> str:
-        cleaned = (text or "").strip().strip('"').strip("'")
-        if preserve_newlines:
-            cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
-            lines = [line.strip() for line in cleaned.split("\n") if line.strip()]
-            return "\n".join(lines)
-        return " ".join(cleaned.split())
-
-    @staticmethod
-    def _split_prompt_tokens(token_prompt: str) -> list[str]:
-        tokens: list[str] = []
-        buffer: list[str] = []
-        stack: list[str] = []
-        opening = {"(": ")", "[": "]", "{": "}", "<": ">"}
-        closing = {")": "(", "]": "[", "}": "{", ">": "<"}
-
-        for char in token_prompt:
-            if char in opening:
-                stack.append(char)
-                buffer.append(char)
-                continue
-            if char in closing:
-                if stack and stack[-1] == closing[char]:
-                    stack.pop()
-                buffer.append(char)
-                continue
-            if char in {",", "\n"} and not stack:
-                fragment = "".join(buffer).strip()
-                if fragment:
-                    tokens.append(fragment)
-                buffer = []
-                continue
-            buffer.append(char)
-
-        tail = "".join(buffer).strip()
-        if tail:
-            tokens.append(tail)
-        return tokens
-
-    @staticmethod
-    def _normalize_token_fragment(fragment: str) -> str:
-        value = (fragment or "").strip().strip('"').strip("'")
-        if not value:
-            return ""
-        # Remove common weight suffixes like "(detail:1.2)" -> "detail".
-        value = re.sub(r"\s*:\s*-?\d+(?:\.\d+)?\s*$", "", value)
-        # Unwrap simple emphasis brackets.
-        for _ in range(3):
-            if len(value) >= 2 and (
-                (value[0] == "(" and value[-1] == ")")
-                or (value[0] == "[" and value[-1] == "]")
-                or (value[0] == "{" and value[-1] == "}")
-            ):
-                value = value[1:-1].strip()
-            else:
-                break
-        value = value.replace("_", " ")
-        value = re.sub(r"\s+", " ", value).strip()
-        return value
-
-    @classmethod
-    def _extract_token_checklist(cls, token_prompt: str) -> list[str]:
-        raw_parts = cls._split_prompt_tokens(token_prompt)
-        checklist: list[str] = []
-        seen: set[str] = set()
-
-        for part in raw_parts:
-            normalized = cls._normalize_token_fragment(part)
-            if len(normalized) < 2:
-                continue
-            key = normalized.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            checklist.append(normalized)
-        return checklist
-
-    @staticmethod
-    def _normalize_text_for_match(text: str) -> str:
-        normalized = (text or "").lower().replace("_", " ")
-        normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
-        normalized = re.sub(r"\s+", " ", normalized).strip()
-        return normalized
-
-    @classmethod
-    def _is_token_covered(cls, token: str, output_text: str) -> bool:
-        token_norm = cls._normalize_text_for_match(token)
-        output_norm = cls._normalize_text_for_match(output_text)
-        if not token_norm:
-            return True
-        if token_norm in output_norm:
-            return True
-
-        token_words = [word for word in token_norm.split() if len(word) >= 3]
-        if not token_words:
-            token_words = token_norm.split()
-        if not token_words:
-            return True
-
-        unique_words = list(dict.fromkeys(token_words))
-        hits = 0
-        for word in unique_words:
-            if re.search(rf"\b{re.escape(word)}\b", output_norm):
-                hits += 1
-
-        threshold = max(1, (len(unique_words) + 1) // 2)
-        return hits >= threshold
-
-    @classmethod
-    def _find_missing_tokens(cls, token_checklist: list[str], output_text: str) -> list[str]:
-        missing: list[str] = []
-        for token in token_checklist:
-            if not cls._is_token_covered(token, output_text):
-                missing.append(token)
-        return missing
-
-    @staticmethod
-    def _build_retry_prompt(
-        token_prompt: str,
-        output_template: str,
-        token_checklist: list[str],
-        previous_output: str,
-        missing_tokens: list[str],
-    ) -> str:
-        missing_lines = [f"{idx}. {token}" for idx, token in enumerate(missing_tokens, start=1)]
-        if output_template == OUTPUT_TEMPLATE_ZIMAGE_STRUCT:
-            return (
-                "Revise the draft prompt below.\n"
-                "Keep the same 6-item output structure exactly:\n"
-                "1. Subject\n2. Scene\n3. Composition\n4. Lighting\n5. Style\n6. Constraints\n"
-                "You must explicitly include all missing token semantics.\n\n"
-                f"Original token prompt:\n{token_prompt}\n\n"
-                "Current draft:\n"
-                f"{previous_output}\n\n"
-                "Missing token checklist:\n"
-                + "\n".join(missing_lines)
-            )
-        return (
-            "Revise the draft prompt below.\n"
-            "Keep it natural, but ensure all missing token semantics are explicitly included.\n\n"
-            f"Original token prompt:\n{token_prompt}\n\n"
-            "Current draft:\n"
-            f"{previous_output}\n\n"
-            "Missing token checklist:\n"
-            + "\n".join(missing_lines)
-        )
-
-    @staticmethod
-    def _append_missing_tokens(output_text: str, output_template: str, missing_tokens: list[str]) -> str:
-        if not missing_tokens:
-            return output_text
-        limited = missing_tokens[:MAX_MISSING_TOKEN_INJECTION]
-        suffix = ", ".join(limited)
-        if len(missing_tokens) > MAX_MISSING_TOKEN_INJECTION:
-            suffix = f"{suffix}, and more"
-
-        if output_template == OUTPUT_TEMPLATE_ZIMAGE_STRUCT:
-            structured = CP_LocalLLMTokenPromptToNatural._force_zimage_structure(output_text)
-            lines = structured.split("\n")
-            updated_lines: list[str] = []
-            for line in lines:
-                if line.lower().startswith("6. constraints:"):
-                    head, _, tail = line.partition(":")
-                    tail_text = tail.strip()
-                    if tail_text and tail_text.lower() != "not specified":
-                        tail_text = f"{tail_text}; Include explicitly: {suffix}."
-                    else:
-                        tail_text = f"Include explicitly: {suffix}."
-                    updated_lines.append(f"{head}: {tail_text}")
-                else:
-                    updated_lines.append(line)
-            return "\n".join(updated_lines)
-
-        base = output_text.strip()
-        separator = "" if base.endswith((".", "!", "?")) else "."
-        return f"{base}{separator} Include explicitly: {suffix}."
-
-    @staticmethod
-    def _postprocess_output(raw_text: str, output_template: str) -> str:
-        output = CP_LocalLLMTokenPromptToNatural._clean_output(
-            raw_text,
-            preserve_newlines=output_template == OUTPUT_TEMPLATE_ZIMAGE_STRUCT,
-        )
-        if output_template == OUTPUT_TEMPLATE_ZIMAGE_STRUCT:
-            output = CP_LocalLLMTokenPromptToNatural._force_zimage_structure(output)
-        return output
-
-    def _generate_with_coverage_guard(
-        self,
-        token_prompt: str,
-        output_template: str,
-        generate_once,
-    ) -> str:
-        token_checklist = self._extract_token_checklist(token_prompt)
-        user_prompt = self._build_user_prompt(token_prompt, output_template, token_checklist)
-        output = self._postprocess_output(generate_once(user_prompt), output_template)
-        if not output:
-            return output
-
-        missing = self._find_missing_tokens(token_checklist, output)
-        for _ in range(TOKEN_COVERAGE_RETRY_ROUNDS):
-            if not missing:
-                break
-            retry_prompt = self._build_retry_prompt(
-                token_prompt=token_prompt,
-                output_template=output_template,
-                token_checklist=token_checklist,
-                previous_output=output,
-                missing_tokens=missing,
-            )
-            revised_output = self._postprocess_output(generate_once(retry_prompt), output_template)
-            if not revised_output:
-                break
-            revised_missing = self._find_missing_tokens(token_checklist, revised_output)
-            if len(revised_missing) <= len(missing):
-                output = revised_output
-                missing = revised_missing
-
-        if missing:
-            output = self._append_missing_tokens(output, output_template, missing)
-        return output
-
-    @staticmethod
-    def _force_zimage_structure(text: str) -> str:
-        values: dict[str, str] = {name: "" for name in STRUCT_SECTION_ORDER}
-        section_pattern = re.compile(
-            r"^\s*(?:\d+\.\s*)?(subject|scene|composition|lighting|style|constraints)\s*:\s*(.*)$",
-            re.IGNORECASE,
-        )
-
-        current_key = None
-        for line in (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-            line_stripped = line.strip()
-            if not line_stripped:
-                continue
-            match = section_pattern.match(line_stripped)
-            if match:
-                matched_key = match.group(1).strip().lower()
-                content = match.group(2).strip()
-                for canonical_name in STRUCT_SECTION_ORDER:
-                    if canonical_name.lower() == matched_key:
-                        current_key = canonical_name
-                        values[current_key] = content
-                        break
-            elif current_key:
-                prior = values[current_key]
-                values[current_key] = f"{prior} {line_stripped}".strip()
-
-        normalized_lines = []
-        for idx, section_name in enumerate(STRUCT_SECTION_ORDER, start=1):
-            value = values[section_name].strip() or "not specified"
-            normalized_lines.append(f"{idx}. {section_name}: {value}")
-        return "\n".join(normalized_lines)
-
-    @classmethod
-    def _resolve_model_path(cls, model_path: str, model_name: str) -> str:
-        raw_path = (model_path or "").strip().strip('"').strip("'")
-        raw_name = (model_name or "").strip().strip('"').strip("'")
-
-        if not raw_path:
-            raise ValueError("model_path is required when backend='llama_cpp'.")
-
-        expanded_path = os.path.expandvars(os.path.expanduser(raw_path))
-        normalized_path = os.path.normpath(expanded_path)
-
-        candidate_path = normalized_path
-        if os.path.isdir(normalized_path):
-            if not raw_name:
-                raise ValueError(
-                    "model_path points to a directory. Set model_name to your GGUF filename."
-                )
-            candidate_path = os.path.join(normalized_path, raw_name)
-
-        if not os.path.exists(candidate_path):
-            raise ValueError(f"GGUF model file does not exist: {candidate_path}")
-        if not os.path.isfile(candidate_path):
-            raise ValueError(f"GGUF model path is not a file: {candidate_path}")
-        if not candidate_path.lower().endswith(".gguf"):
-            raise ValueError(f"Model file must be .gguf: {candidate_path}")
-
-        return os.path.normpath(candidate_path)
-
-    @classmethod
-    def _resolve_effective_gpu_layers(cls, llm_device: str, gpu_layers: int) -> int:
-        if llm_device == LLM_DEVICE_CPU:
-            return 0
-        # In GPU mode, non-positive values mean "offload as many layers as possible".
-        if gpu_layers <= 0:
-            return 999
-        return gpu_layers
-
-    @staticmethod
-    def _supports_llama_gpu_offload() -> bool | None:
-        try:
-            import llama_cpp
-        except Exception:
-            return None
-
-        supports_fn = getattr(llama_cpp, "llama_supports_gpu_offload", None)
-        if callable(supports_fn):
-            try:
-                return bool(supports_fn())
-            except Exception:
-                return None
-        return None
-
-    @classmethod
-    def _close_llama_instance(cls, instance: Any) -> None:
-        close_fn = getattr(instance, "close", None)
-        if callable(close_fn):
-            try:
-                close_fn()
-            except Exception:
-                pass
-
-    @classmethod
-    def _unload_llama_by_key(cls, cache_key: tuple[str, int, int]) -> None:
-        instance = None
-        with cls._cache_lock:
-            instance = cls._llama_cache.pop(cache_key, None)
-            cls._ram_keeper_keys.discard(cache_key)
-        if instance is not None:
-            cls._close_llama_instance(instance)
-
-    @classmethod
-    def _ensure_ram_keeper(cls, model_path: str, model_name: str) -> None:
-        try:
-            _, keeper_key = cls._load_llama(
-                model_path=model_path,
-                model_name=model_name,
-                context_size=RAM_KEEPER_CONTEXT_SIZE,
-                effective_gpu_layers=0,
-            )
-            with cls._cache_lock:
-                cls._ram_keeper_keys.add(keeper_key)
-        except Exception:
-            # Best effort: inference result should not fail if RAM parking is unavailable.
-            pass
-
-    @classmethod
-    def _drop_ram_keepers_for_model_path(cls, resolved_model_path: str) -> None:
-        to_remove: list[tuple[str, int, int]] = []
-        with cls._cache_lock:
-            for key in list(cls._ram_keeper_keys):
-                if key[0] == resolved_model_path:
-                    to_remove.append(key)
-                    cls._ram_keeper_keys.discard(key)
-        for key in to_remove:
-            cls._unload_llama_by_key(key)
-
-    @classmethod
-    def _load_llama(
-        cls,
-        model_path: str,
-        model_name: str,
-        context_size: int,
-        effective_gpu_layers: int,
-    ):
-        resolved_model_path = cls._resolve_model_path(model_path=model_path, model_name=model_name)
-
-        cache_key = (resolved_model_path, context_size, effective_gpu_layers)
-
-        with cls._cache_lock:
-            cached = cls._llama_cache.get(cache_key)
-            if cached is not None:
-                return cached, cache_key
-
-            try:
-                from llama_cpp import Llama
-            except Exception as exc:
-                raise RuntimeError(
-                    "llama-cpp-python is not installed. Install dependencies from requirements.txt."
-                ) from exc
-
-            if effective_gpu_layers > 0:
-                supports_gpu = cls._supports_llama_gpu_offload()
-                if supports_gpu is False:
-                    raise RuntimeError(
-                        "Current llama-cpp-python build does not support GPU offload. "
-                        "Install a GPU-enabled llama-cpp-python wheel/build."
-                    )
-
-            instance = Llama(
-                model_path=resolved_model_path,
-                n_ctx=context_size,
-                n_gpu_layers=effective_gpu_layers,
-                verbose=False,
-            )
-            cls._llama_cache[cache_key] = instance
-            return instance, cache_key
-
-    def _call_ollama(
-        self,
-        token_prompt: str,
-        model_name: str,
-        endpoint: str,
-        temperature: float,
-        top_p: float,
-        max_tokens: int,
-        seed: int,
-        timeout_sec: int,
-        output_template: str,
-        llm_device: str,
-        model_residency: str,
-        system_prompt: str,
-    ) -> str:
-        url = f"{endpoint.rstrip('/')}/api/generate"
-        options = {
-            "temperature": temperature,
-            "top_p": top_p,
-            "num_predict": max_tokens,
-        }
-        if seed >= 0:
-            options["seed"] = seed
-        if llm_device == LLM_DEVICE_CPU:
-            options["num_gpu"] = 0
-
-        def generate_once(user_prompt: str) -> str:
-            payload = {
-                "model": model_name,
-                "system": system_prompt,
-                "prompt": user_prompt,
-                "stream": False,
-                "options": options,
-            }
-            if model_residency == MODEL_RESIDENCY_KEEP:
-                payload["keep_alive"] = "30m"
-            elif model_residency == MODEL_RESIDENCY_UNLOAD:
-                payload["keep_alive"] = 0
-            try:
-                response = requests.post(url, json=payload, timeout=timeout_sec)
-                response.raise_for_status()
-            except requests.RequestException as exc:
-                raise RuntimeError(f"Ollama request failed: {exc}") from exc
-            data = response.json()
-            return data.get("response", "")
-
-        output = self._generate_with_coverage_guard(
-            token_prompt=token_prompt,
-            output_template=output_template,
-            generate_once=generate_once,
-        )
-        if not output:
-            raise RuntimeError("Ollama returned an empty response.")
-        return output
-
-    def _call_llama_cpp(
-        self,
-        token_prompt: str,
-        model_path: str,
-        model_name: str,
-        temperature: float,
-        top_p: float,
-        max_tokens: int,
-        seed: int,
-        context_size: int,
-        gpu_layers: int,
-        output_template: str,
-        llm_device: str,
-        model_residency: str,
-        system_prompt: str,
-    ) -> str:
-        resolved_model_path = self._resolve_model_path(model_path=model_path, model_name=model_name)
-        effective_gpu_layers = self._resolve_effective_gpu_layers(llm_device=llm_device, gpu_layers=gpu_layers)
-        cache_key = None
-        try:
-            llm, cache_key = self._load_llama(
-                model_path=model_path,
-                model_name=model_name,
-                context_size=context_size,
-                effective_gpu_layers=effective_gpu_layers,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "llama.cpp model init failed. Check model_path/model_name and ensure llama-cpp-python is up to date."
-            ) from exc
-
-        def generate_once(user_prompt: str) -> str:
-            request_payload = {
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "top_p": top_p,
-            }
-            if seed >= 0:
-                request_payload["seed"] = seed
-            try:
-                result = llm.create_chat_completion(**request_payload)
-            except Exception as exc:
-                raise RuntimeError(f"llama.cpp inference failed: {exc}") from exc
-            try:
-                return result["choices"][0]["message"]["content"]
-            except (KeyError, IndexError, TypeError) as exc:
-                raise RuntimeError("llama.cpp returned an unexpected response format.") from exc
-
-        try:
-            output = self._generate_with_coverage_guard(
-                token_prompt=token_prompt,
-                output_template=output_template,
-                generate_once=generate_once,
-            )
-        finally:
-            if cache_key is not None:
-                if model_residency == MODEL_RESIDENCY_UNLOAD:
-                    if llm_device == LLM_DEVICE_GPU:
-                        self._ensure_ram_keeper(model_path=model_path, model_name=model_name)
-                    self._unload_llama_by_key(cache_key)
-                elif model_residency == MODEL_RESIDENCY_FULL_UNLOAD:
-                    self._unload_llama_by_key(cache_key)
-                    self._drop_ram_keepers_for_model_path(resolved_model_path)
-        if not output:
-            raise RuntimeError("llama.cpp returned an empty response.")
-        return output
-
-    def convert(
-        self,
-        token_prompt: str,
-        output_template: str,
-        backend: str,
-        model_name: str,
-        endpoint: str,
-        model_path: str,
-        llm_device: str,
-        model_residency: str,
-        temperature: float,
-        top_p: float,
-        max_tokens: int,
-        seed: int,
-        timeout_sec: int,
-        context_size: int,
-        gpu_layers: int,
-        system_prompt: str,
-    ):
-        normalized_prompt = token_prompt.strip()
-        if not normalized_prompt:
-            return ("",)
-        normalized_template = (output_template or OUTPUT_TEMPLATE_DEFAULT).strip().lower()
-        if normalized_template not in (OUTPUT_TEMPLATE_DEFAULT, OUTPUT_TEMPLATE_ZIMAGE_STRUCT):
-            raise ValueError(f"Unsupported output_template: {output_template}")
-        normalized_device = (llm_device or LLM_DEVICE_GPU).strip().lower()
-        if normalized_device not in (LLM_DEVICE_GPU, LLM_DEVICE_CPU):
-            raise ValueError(f"Unsupported llm_device: {llm_device}")
-        normalized_residency = (model_residency or MODEL_RESIDENCY_KEEP).strip().lower()
-        if normalized_residency not in (
-            MODEL_RESIDENCY_KEEP,
-            MODEL_RESIDENCY_UNLOAD,
-            MODEL_RESIDENCY_FULL_UNLOAD,
-        ):
-            raise ValueError(f"Unsupported model_residency: {model_residency}")
-
-        if backend == "ollama":
-            natural_prompt = self._call_ollama(
-                token_prompt=normalized_prompt,
-                model_name=model_name,
-                endpoint=endpoint,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-                seed=seed,
-                timeout_sec=timeout_sec,
-                output_template=normalized_template,
-                llm_device=normalized_device,
-                model_residency=normalized_residency,
-                system_prompt=system_prompt,
-            )
-        elif backend == "llama_cpp":
-            natural_prompt = self._call_llama_cpp(
-                token_prompt=normalized_prompt,
-                model_path=model_path,
-                model_name=model_name,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-                seed=seed,
-                context_size=context_size,
-                gpu_layers=gpu_layers,
-                output_template=normalized_template,
-                llm_device=normalized_device,
-                model_residency=normalized_residency,
-                system_prompt=system_prompt,
-            )
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
-
-        return (natural_prompt,)
-
 #Seed batch generator
 class CP_SeedIncrementBatchGen:
     @classmethod
@@ -1616,6 +927,283 @@ class CP_VaeForwarding:
     def forward(self, vae):
         return (vae,)
 
+
+class CP_ShowAnything:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "anything": (any,),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    FUNCTION = "show"
+    OUTPUT_NODE = True
+    CATEGORY = categoryFolder
+
+    @staticmethod
+    def _to_text(value):
+        if isinstance(value, str):
+            return value
+
+        if isinstance(value, (dict, list, tuple)):
+            try:
+                return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+            except (TypeError, ValueError):
+                pass
+
+        return str(value)
+
+    def show(self, anything):
+        text = self._to_text(anything)
+        return {"ui": {"text": [text]}, "result": (text,)}
+
+
+_MATH_EXPRESSION_OPERATORS = {
+    ast.Add: op.add,
+    ast.Sub: op.sub,
+    ast.Mult: op.mul,
+    ast.Div: op.truediv,
+    ast.FloorDiv: op.floordiv,
+    ast.Pow: op.pow,
+    ast.BitXor: op.xor,
+    ast.USub: op.neg,
+    ast.UAdd: op.pos,
+    ast.Mod: op.mod,
+    ast.BitAnd: op.and_,
+    ast.BitOr: op.or_,
+    ast.Invert: op.invert,
+    ast.And: lambda left, right: 1 if left and right else 0,
+    ast.Or: lambda left, right: 1 if left or right else 0,
+    ast.Not: lambda value: 0 if value else 1,
+    ast.RShift: op.rshift,
+    ast.LShift: op.lshift,
+}
+
+_MATH_EXPRESSION_FUNCTIONS = {
+    "round": ((1, 2), lambda value, digits=None: round(value, digits)),
+    "ceil": ((1, 1), math.ceil),
+    "floor": ((1, 1), math.floor),
+    "min": ((2, None), min),
+    "max": ((2, None), max),
+    "randomint": ((2, 2), random.randint),
+    "randomchoice": ((2, None), lambda *values: random.choice(values)),
+    "sqrt": ((1, 1), math.sqrt),
+    "int": ((1, 1), int),
+    "iif": (
+        (3, 3),
+        lambda condition, true_value, false_value: true_value if condition else false_value,
+    ),
+}
+
+_MATH_EXPRESSION_COMPARATORS = {
+    ast.Eq: op.eq,
+    ast.NotEq: op.ne,
+    ast.Gt: op.gt,
+    ast.GtE: op.ge,
+    ast.Lt: op.lt,
+    ast.LtE: op.le,
+}
+
+
+class CP_MathExpression:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "expression": (
+                    "STRING",
+                    {"multiline": True, "dynamicPrompts": False},
+                ),
+            },
+            "optional": {
+                "a": (any,),
+                "b": (any,),
+                "c": (any,),
+            },
+            "hidden": {
+                "extra_pnginfo": "EXTRA_PNGINFO",
+                "prompt": "PROMPT",
+            },
+        }
+
+    RETURN_TYPES = ("INT", "FLOAT")
+    RETURN_NAMES = ("int", "float")
+    FUNCTION = "evaluate"
+    CATEGORY = categoryFolder
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(cls, expression, **_kwargs):
+        if "random" in expression:
+            return float("nan")
+        return expression
+
+    @staticmethod
+    def _get_widget_value(extra_pnginfo, prompt, node_name, widget_name):
+        workflow = (extra_pnginfo or {}).get("workflow") or {"nodes": []}
+        node_id = None
+
+        for workflow_node in workflow.get("nodes", []):
+            properties = workflow_node.get("properties") or {}
+            names = (
+                properties.get("Node name for S&R"),
+                workflow_node.get("type"),
+                workflow_node.get("title"),
+            )
+            if node_name in names:
+                node_id = workflow_node.get("id")
+                break
+
+        if node_id is None:
+            raise NameError(f"Node not found: {node_name}.{widget_name}")
+
+        prompt_node = (prompt or {}).get(str(node_id), {})
+        inputs = prompt_node.get("inputs", {})
+        if widget_name not in inputs:
+            raise NameError(f"Widget not found: {node_name}.{widget_name}")
+
+        value = inputs[widget_name]
+        if isinstance(value, list):
+            raise ValueError(
+                "Converted widgets are not supported via named reference; "
+                "use an input instead."
+            )
+        return value
+
+    @staticmethod
+    def _get_size(target, property_name):
+        if isinstance(target, dict) and "samples" in target:
+            samples = target["samples"]
+            return samples.shape[3 if property_name == "width" else 2] * 8
+
+        if hasattr(target, "shape") and len(target.shape) >= 3:
+            return target.shape[2 if property_name == "width" else 1]
+
+        raise TypeError("width/height can only be read from an IMAGE or LATENT input")
+
+    def evaluate(self, expression, prompt=None, extra_pnginfo=None, a=None, b=None, c=None):
+        parsed = ast.parse(
+            expression.replace("\n", " ").replace("\r", ""),
+            mode="eval",
+        ).body
+        lookup = {"a": a, "b": b, "c": c}
+
+        def eval_binary(operator_node, left_node, right_node):
+            operator = _MATH_EXPRESSION_OPERATORS.get(type(operator_node))
+            if operator is None:
+                raise NotImplementedError(
+                    f"Operator {type(operator_node).__name__} is not supported"
+                )
+
+            left = eval_expr(left_node)
+            right = eval_expr(right_node)
+            left = left if isinstance(left, int) else float(left)
+            right = right if isinstance(right, int) else float(right)
+            return operator(left, right)
+
+        def eval_expr(node):
+            if isinstance(node, ast.Constant):
+                if isinstance(node.value, (int, float)):
+                    return node.value
+                raise TypeError(f"Unsupported constant: {node.value!r}")
+
+            if isinstance(node, ast.BinOp):
+                return eval_binary(node.op, node.left, node.right)
+
+            if isinstance(node, ast.BoolOp):
+                result = eval_expr(node.values[0])
+                for value_node in node.values[1:]:
+                    operator = _MATH_EXPRESSION_OPERATORS[type(node.op)]
+                    result = operator(result, eval_expr(value_node))
+                return result
+
+            if isinstance(node, ast.UnaryOp):
+                operator = _MATH_EXPRESSION_OPERATORS.get(type(node.op))
+                if operator is None:
+                    raise NotImplementedError(
+                        f"Operator {type(node.op).__name__} is not supported"
+                    )
+                return operator(eval_expr(node.operand))
+
+            if isinstance(node, ast.Attribute):
+                if not isinstance(node.value, ast.Name):
+                    raise TypeError("Only direct input or node widget references are supported")
+
+                source_name = node.value.id
+                if source_name in lookup and node.attr in ("width", "height"):
+                    return self._get_size(lookup[source_name], node.attr)
+                return self._get_widget_value(
+                    extra_pnginfo,
+                    prompt,
+                    source_name,
+                    node.attr,
+                )
+
+            if isinstance(node, ast.Name):
+                if node.id not in lookup:
+                    raise NameError(f"Name not found: {node.id}")
+
+                value = lookup[node.id]
+                if isinstance(value, (int, float, complex)):
+                    return value
+                raise TypeError(
+                    "Complex types (LATENT/IMAGE) must reference width or height, "
+                    f"for example {node.id}.width"
+                )
+
+            if isinstance(node, ast.Call):
+                if not isinstance(node.func, ast.Name):
+                    raise NameError("Invalid function call")
+                if node.keywords:
+                    raise SyntaxError("Keyword arguments are not supported")
+
+                function_data = _MATH_EXPRESSION_FUNCTIONS.get(node.func.id)
+                if function_data is None:
+                    raise NameError(f"Invalid function call: {node.func.id}")
+
+                (minimum, maximum), function = function_data
+                argument_count = len(node.args)
+                if argument_count < minimum or (
+                    maximum is not None and argument_count > maximum
+                ):
+                    expected = (
+                        f"{minimum} or more"
+                        if maximum is None
+                        else f"{minimum} to {maximum}"
+                    )
+                    raise SyntaxError(
+                        f"Invalid function call: {node.func.id} requires "
+                        f"{expected} arguments"
+                    )
+
+                return function(*(eval_expr(argument) for argument in node.args))
+
+            if isinstance(node, ast.Compare):
+                left = eval_expr(node.left)
+                for operator_node, comparator_node in zip(node.ops, node.comparators):
+                    comparator = _MATH_EXPRESSION_COMPARATORS.get(type(operator_node))
+                    if comparator is None:
+                        raise NotImplementedError(
+                            f"Operator {type(operator_node).__name__} is not supported"
+                        )
+                    right = eval_expr(comparator_node)
+                    if not comparator(left, right):
+                        return 0
+                    left = right
+                return 1
+
+            raise TypeError(f"Unsupported expression element: {type(node).__name__}")
+
+        result = eval_expr(parsed)
+        return {
+            "ui": {"value": [result]},
+            "result": (int(result), float(result)),
+        }
+
+
 NODE_CLASS_MAPPINGS_TOOLS = {
     "CP AspectRatioCheck" : CP_AspectRatioCheck,
     "CP Float 0 to 1" : CP_FloatZeroToOne,
@@ -1641,9 +1229,10 @@ NODE_CLASS_MAPPINGS_TOOLS = {
     "CP SaveTextToFile": CP_SaveTextToFile,
     "CP BatchImageWatermarkText": CP_BatchImageWatermarkText,
     "CP AssemblyFoldersDatasetPreparation": CP_AssemblyFoldersDatasetPreparation,
-    "CP LocalLLMTokenPromptToNatural": CP_LocalLLMTokenPromptToNatural,
     "CP SeedIncrementBatchGen": CP_SeedIncrementBatchGen,
     "CP VaeForwarding": CP_VaeForwarding,
+    "CP ShowAnything": CP_ShowAnything,
+    "MathExpression|pysssss": CP_MathExpression,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS_TOOLS = {
@@ -1671,7 +1260,8 @@ NODE_DISPLAY_NAME_MAPPINGS_TOOLS = {
     "CP SaveTextToFile": "Save Text To File",
     "CP BatchImageWatermarkText": "Batch Image Watermark Text",
     "CP AssemblyFoldersDatasetPreparation": "Assembly folders dataset preparation",
-    "CP LocalLLMTokenPromptToNatural": "Token Prompt -> Natural Prompt (Local LLM)",
     "CP SeedIncrementBatchGen": "Seed Increment Batch Gen",
     "CP VaeForwarding": "VAE Forwarding",
+    "CP ShowAnything": "Show Anything",
+    "MathExpression|pysssss": "Math Expression",
 }

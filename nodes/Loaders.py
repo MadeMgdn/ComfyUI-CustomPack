@@ -4,13 +4,8 @@ import comfy.sd
 import comfy.utils
 import folder_paths
 import torch
-
-try:
-    from aiohttp import web
-    from server import PromptServer
-except Exception:
-    web = None
-    PromptServer = None
+from aiohttp import web
+from server import PromptServer
 
 
 categoryFolder = "Custom pack/Loaders"

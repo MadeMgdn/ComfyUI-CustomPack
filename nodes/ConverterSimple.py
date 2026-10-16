@@ -1,3 +1,6 @@
+import math
+
+
 categoryFolder = "Custom pack/Converter/Simple"
 
 
@@ -64,6 +67,27 @@ def _to_float(value):
             return 0.0
     try:
         return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _to_rounded_int(value, rounding):
+    rounding_functions = {
+        "round": round,
+        "ceiling": math.ceil,
+        "floor": math.floor,
+    }
+    rounding_function = rounding_functions.get(rounding, round)
+
+    try:
+        return int(rounding_function(_to_float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _to_rounded_float(value, digits):
+    try:
+        return float(round(_to_float(value), int(digits)))
     except (TypeError, ValueError, OverflowError):
         return 0.0
 
@@ -162,29 +186,45 @@ class CP_StringToAnything:
 class CP_StringToInt:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"value": ("STRING", {"forceInput": True})}}
+        return {
+            "required": {
+                "value": ("STRING", {"forceInput": True}),
+                "rounding": (
+                    ["round", "ceiling", "floor"],
+                    {"default": "round"},
+                ),
+            }
+        }
 
     RETURN_TYPES = ("INT",)
     RETURN_NAMES = ("int",)
     FUNCTION = "convert"
     CATEGORY = categoryFolder
 
-    def convert(self, value):
-        return (_to_int(value),)
+    def convert(self, value, rounding="round"):
+        return (_to_rounded_int(value, rounding),)
 
 
 class CP_StringToFloat:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"value": ("STRING", {"forceInput": True})}}
+        return {
+            "required": {
+                "value": ("STRING", {"forceInput": True}),
+                "digits": (
+                    "INT",
+                    {"default": 1, "min": 0, "max": 15, "step": 1},
+                ),
+            }
+        }
 
     RETURN_TYPES = ("FLOAT",)
     RETURN_NAMES = ("float",)
     FUNCTION = "convert"
     CATEGORY = categoryFolder
 
-    def convert(self, value):
-        return (_to_float(value),)
+    def convert(self, value, digits=1):
+        return (_to_rounded_float(value, digits),)
 
 
 class CP_StringToBoolean:
@@ -232,15 +272,23 @@ class CP_IntToAnything:
 class CP_IntToFloat:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"value": ("INT", {"forceInput": True})}}
+        return {
+            "required": {
+                "value": ("INT", {"forceInput": True}),
+                "digits": (
+                    "INT",
+                    {"default": 1, "min": 0, "max": 15, "step": 1},
+                ),
+            }
+        }
 
     RETURN_TYPES = ("FLOAT",)
     RETURN_NAMES = ("float",)
     FUNCTION = "convert"
     CATEGORY = categoryFolder
 
-    def convert(self, value):
-        return (_to_float(value),)
+    def convert(self, value, digits=1):
+        return (_to_rounded_float(value, digits),)
 
 
 class CP_IntToBoolean:
@@ -274,15 +322,23 @@ class CP_FloatToString:
 class CP_FloatToInt:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"value": ("FLOAT", {"forceInput": True})}}
+        return {
+            "required": {
+                "value": ("FLOAT", {"forceInput": True}),
+                "rounding": (
+                    ["round", "ceiling", "floor"],
+                    {"default": "round"},
+                ),
+            }
+        }
 
     RETURN_TYPES = ("INT",)
     RETURN_NAMES = ("int",)
     FUNCTION = "convert"
     CATEGORY = categoryFolder
 
-    def convert(self, value):
-        return (_to_int(value),)
+    def convert(self, value, rounding="round"):
+        return (_to_rounded_int(value, rounding),)
 
 
 class CP_FloatToAnything:
