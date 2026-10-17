@@ -7,7 +7,9 @@ import folder_paths
 import numpy as np
 import torch
 from PIL import Image
+from comfy import model_management
 from nodes import MAX_RESOLUTION
+from segment_anything import SamPredictor, sam_model_registry
 from ultralytics import YOLO
 
 
@@ -66,6 +68,11 @@ def update_model_paths(model_path):
     add_folder_path_and_extensions(
         "ultralytics",
         [os.path.join(model_path, "ultralytics")],
+        extensions,
+    )
+    add_folder_path_and_extensions(
+        "sams",
+        [os.path.join(model_path, "sams")],
         extensions,
     )
 
@@ -607,6 +614,182 @@ def make_sam_mask(
     return make_3d_mask(mask)
 
 
+def _sam_predict(predictor, points, point_labels, bbox, threshold):
+    point_coords = None if not points else np.asarray(points)
+    point_labels = None if not point_labels else np.asarray(point_labels)
+    box = None if bbox is None else np.asarray([bbox])
+
+    masks, scores, _ = predictor.predict(
+        point_coords=point_coords,
+        point_labels=point_labels,
+        box=box,
+    )
+
+    selected_masks = []
+    best_score = float("-inf")
+    best_mask = None
+    for mask, score in zip(masks, scores):
+        score = float(score)
+        if score > best_score:
+            best_score = score
+            best_mask = mask
+        if score >= threshold:
+            selected_masks.append(mask)
+
+    if not selected_masks and best_mask is not None:
+        selected_masks.append(best_mask)
+
+    return selected_masks
+
+
+def _module_device(module):
+    device = getattr(module, "device", None)
+    if device is not None:
+        return torch.device(device)
+
+    try:
+        return next(module.parameters()).device
+    except (AttributeError, StopIteration):
+        return torch.device("cpu")
+
+
+class _ImpactSafeToGPU:
+    def __init__(self, model_size):
+        self.model_size = model_size
+
+    def to_device(self, model, device):
+        target_device = torch.device(device)
+        if target_device.type == "cpu":
+            model.to(target_device)
+            return
+
+        if _module_device(model).type != "cpu":
+            return
+
+        required_memory = int(self.model_size * 1.3)
+        model_management.free_memory(required_memory, target_device)
+        if model_management.get_free_memory(target_device) <= required_memory:
+            LOG.warning(
+                "[Impact] SAM model remains on CPU because there is not enough free VRAM."
+            )
+            return
+
+        try:
+            model.to(target_device)
+        except Exception as error:
+            LOG.warning(
+                "[Impact] SAM model could not be moved to %s: %s",
+                target_device,
+                error,
+            )
+
+
+class _ImpactSAMWrapper:
+    def __init__(self, model, is_auto_mode, safe_to_gpu):
+        self.model = model
+        self.is_auto_mode = is_auto_mode
+        self.safe_to_gpu = safe_to_gpu
+
+    def prepare_device(self):
+        if self.is_auto_mode:
+            self.safe_to_gpu.to_device(
+                self.model,
+                model_management.get_torch_device(),
+            )
+
+    def release_device(self):
+        if self.is_auto_mode:
+            self.model.to(device="cpu")
+
+    def predict(self, image, points, point_labels, bbox, threshold):
+        predictor = SamPredictor(self.model)
+        predictor.set_image(image, "RGB")
+        return _sam_predict(
+            predictor,
+            points,
+            point_labels,
+            bbox,
+            threshold,
+        )
+
+
+class CP_ImpactSAMLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        models = []
+        for filename in folder_paths.get_filename_list("sams"):
+            normalized = filename.lower()
+            if "hq" in normalized or "sam2" in normalized:
+                continue
+            if normalized.endswith((".pt", ".pth", ".safetensors")):
+                models.append(filename)
+
+        return {
+            "required": {
+                "model_name": (
+                    models,
+                    {
+                        "tooltip": (
+                            "Loads a Segment Anything checkpoint from models/sams."
+                        ),
+                    },
+                ),
+                "device_mode": (
+                    ["AUTO", "Prefer GPU", "CPU"],
+                    {
+                        "tooltip": (
+                            "AUTO moves SAM to the active device only while detecting. "
+                            "Prefer GPU keeps it on the active device when VRAM permits. "
+                            "CPU keeps it in system memory."
+                        ),
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("SAM_MODEL",)
+    FUNCTION = "load_model"
+    CATEGORY = categoryFolder
+    DESCRIPTION = (
+        "Loads a Segment Anything model for Impact-compatible SAM detection."
+    )
+
+    def load_model(self, model_name, device_mode="AUTO"):
+        model_path = folder_paths.get_full_path("sams", model_name)
+        if model_path is None:
+            raise FileNotFoundError(
+                f"SAM model '{model_name}' was not found in models/sams."
+            )
+
+        normalized_name = model_name.lower()
+        if "vit_h" in normalized_name:
+            model_kind = "vit_h"
+        elif "vit_l" in normalized_name:
+            model_kind = "vit_l"
+        else:
+            model_kind = "vit_b"
+
+        sam = sam_model_registry[model_kind](checkpoint=model_path)
+        safe_to_gpu = _ImpactSafeToGPU(os.path.getsize(model_path))
+
+        if device_mode == "Prefer GPU":
+            safe_to_gpu.to_device(sam, model_management.get_torch_device())
+        elif device_mode == "CPU":
+            sam.to(device="cpu")
+
+        sam.sam_wrapper = _ImpactSAMWrapper(
+            sam,
+            is_auto_mode=device_mode == "AUTO",
+            safe_to_gpu=safe_to_gpu,
+        )
+        LOG.info(
+            "[Impact] Loaded SAM model: %s (device mode: %s)",
+            model_path,
+            device_mode,
+        )
+        return (sam,)
+
+
 class CP_ImpactUltralyticsDetectorProvider:
     @classmethod
     def INPUT_TYPES(cls):
@@ -826,9 +1009,11 @@ class CP_ImpactFaceDetectorOnly:
 NODE_CLASS_MAPPINGS_IMPORTED_IMPACT_ULTRALYTICS = {
     "UltralyticsDetectorProvider": CP_ImpactUltralyticsDetectorProvider,
     "FaceDetectorOnly": CP_ImpactFaceDetectorOnly,
+    "SAMLoader": CP_ImpactSAMLoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS_IMPORTED_IMPACT_ULTRALYTICS = {
     "UltralyticsDetectorProvider": "UltralyticsDetectorProvider",
     "FaceDetectorOnly": "Face Detector Only",
+    "SAMLoader": "SAMLoader (Impact)",
 }
