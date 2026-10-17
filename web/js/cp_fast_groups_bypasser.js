@@ -493,7 +493,9 @@ function removeWidget(node, widgetOrIndex) {
 function refreshWidgets(node) {
     ensureProperties(node);
 
+    const previousSize = [...(node.size || [260, 0])];
     const groups = getVisibleGroups(node);
+    let widgetStructureChanged = false;
     let index = 0;
 
     for (const group of groups) {
@@ -504,6 +506,7 @@ function refreshWidgets(node) {
         if (!widget) {
             widget = new FastGroupToggleWidget(group, node);
             node.addCustomWidget(widget);
+            widgetStructureChanged = true;
             dirty = true;
         }
 
@@ -535,11 +538,16 @@ function refreshWidgets(node) {
 
     while ((node.widgets || []).length > index) {
         removeWidget(node, index);
+        widgetStructureChanged = true;
     }
 
-    const size = node.computeSize();
-    size[0] = Math.max(size[0], 260);
-    node.setSize?.(size);
+    if (widgetStructureChanged) {
+        const computedSize = node.computeSize();
+        node.setSize?.([
+            Math.max(previousSize[0], computedSize[0], 260),
+            Math.max(previousSize[1], computedSize[1]),
+        ]);
+    }
 }
 
 function scheduleRefresh(ms = 500) {
