@@ -6,7 +6,7 @@ class IntLiteral:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "Number": ("STRING", {}),
+                "Number": ("INT", {}),
             }
         }
 
@@ -27,7 +27,7 @@ class FloatLiteral:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "Number": ("STRING", {}),
+                "Number": ("FLOAT", {}),
             }
         }
 
