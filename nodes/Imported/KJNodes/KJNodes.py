@@ -1480,6 +1480,40 @@ class CP_KJNodesLazySwitchKJ:
         return (on_true if switch else on_false,)
 
 
+class CP_KJNodesGetImagesFromBatchIndexed:
+    DESCRIPTION = (
+        "Selects and returns the images at the specified indices as an image batch."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "indexes": (
+                    "STRING",
+                    {
+                        "default": "0, 1, 2",
+                        "multiline": True,
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "indexedimagesfrombatch"
+    CATEGORY = categoryFolder
+
+    def indexedimagesfrombatch(self, images, indexes):
+        index_list = [int(index.strip()) for index in indexes.split(",")]
+        indices_tensor = torch.tensor(
+            index_list,
+            dtype=torch.long,
+            device=images.device,
+        )
+        return (images[indices_tensor],)
+
+
 NODE_CLASS_MAPPINGS_IMPORTED_KJNODES_KJNODES = {
     "ImageResizeKJ": CP_KJNodesImageResizeKJ,
     "ImageResizeKJv2": CP_KJNodesImageResizeKJv2,
@@ -1487,6 +1521,7 @@ NODE_CLASS_MAPPINGS_IMPORTED_KJNODES_KJNODES = {
     "LTX2SamplingPreviewOverride": CP_KJNodesLTX2SamplingPreviewOverride,
     "SimpleCalculatorKJ": CP_KJNodesSimpleCalculatorKJ,
     "LazySwitchKJ": CP_KJNodesLazySwitchKJ,
+    "GetImagesFromBatchIndexed": CP_KJNodesGetImagesFromBatchIndexed,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS_IMPORTED_KJNODES_KJNODES = {
@@ -1496,4 +1531,5 @@ NODE_DISPLAY_NAME_MAPPINGS_IMPORTED_KJNODES_KJNODES = {
     "LTX2SamplingPreviewOverride": "LTX2 Sampling Preview Override",
     "SimpleCalculatorKJ": "Simple Calculator KJ",
     "LazySwitchKJ": "Lazy Switch KJ",
+    "GetImagesFromBatchIndexed": "Get Images From Batch Indexed",
 }
