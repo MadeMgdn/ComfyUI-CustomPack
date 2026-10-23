@@ -6,7 +6,7 @@ class IntLiteral:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "Number": ("INT", {}),
+                "Number": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1}),
             }
         }
 
