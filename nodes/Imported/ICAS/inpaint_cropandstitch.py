@@ -691,10 +691,37 @@ class InpaintCropImproved:
  
     def inpaint_crop(self, image, downscale_algorithm, upscale_algorithm, preresize, preresize_mode, preresize_min_width, preresize_min_height, preresize_max_width, preresize_max_height, extend_for_outpainting, extend_up_factor, extend_down_factor, extend_left_factor, extend_right_factor, mask_hipass_filter, mask_fill_holes, mask_expand_pixels, mask_invert, mask_blend_pixels, context_from_mask_extend_factor, output_resize_to_target_size, output_target_width, output_target_height, output_padding, mask=None, optional_context_mask=None):
         image = image.clone()
+        if image.ndim == 3:
+            image = image.unsqueeze(0)
+        if image.ndim != 4:
+            raise ValueError(
+                "Inpaint Crop expected IMAGE with shape [B,H,W,C] or [H,W,C], "
+                f"got {tuple(image.shape)}"
+            )
+
         if mask is not None:
             mask = mask.clone()
+            if mask.ndim == 2:
+                mask = mask.unsqueeze(0)
+            elif mask.ndim == 4 and mask.shape[-1] == 1:
+                mask = mask[..., 0]
+            if mask.ndim != 3:
+                raise ValueError(
+                    "Inpaint Crop expected MASK with shape [B,H,W] or [H,W], "
+                    f"got {tuple(mask.shape)}"
+                )
+
         if optional_context_mask is not None:
             optional_context_mask = optional_context_mask.clone()
+            if optional_context_mask.ndim == 2:
+                optional_context_mask = optional_context_mask.unsqueeze(0)
+            elif optional_context_mask.ndim == 4 and optional_context_mask.shape[-1] == 1:
+                optional_context_mask = optional_context_mask[..., 0]
+            if optional_context_mask.ndim != 3:
+                raise ValueError(
+                    "Inpaint Crop expected optional_context_mask with shape "
+                    f"[B,H,W] or [H,W], got {tuple(optional_context_mask.shape)}"
+                )
 
         output_padding = int(output_padding)
         

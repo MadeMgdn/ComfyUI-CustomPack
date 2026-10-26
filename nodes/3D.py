@@ -1151,6 +1151,11 @@ BLEND_MODES = (
     "luminosity",
 )
 GAUSSIAN_BLUR_TARGETS = ("rgb", "blend_mask", "rgb_and_mask")
+COVERAGE_MODES = ("angular_sector", "all_camera_visible")
+CAMERA_COMPOSITE_MODES = ("ordered_layers", "weighted_average")
+GEOMETRY_ALIGN_FIT_MODES = ("contain", "stretch", "none")
+GEOMETRY_ALIGN_MASK_MODES = ("target", "intersection", "warped_source")
+HUMANOID_GLOBAL_MODELS = ("similarity", "affine")
 
 
 @dataclass(frozen=True)
@@ -1170,8 +1175,57 @@ class ReprojectionViewSettings:
     crop_right_percent: float = 0.0
     crop_top_percent: float = 0.0
     crop_bottom_percent: float = 0.0
+    coverage_mode: str = "angular_sector"
+    camera_feather_pixels: float = 0.0
+    camera_feather_inset_pixels: float = 0.0
 
 
+@dataclass(frozen=True)
+class GeometryAlignSettings:
+    view: str
+    global_fit_mode: str
+    global_alignment_strength: float
+    local_alignment_strength: float
+    max_local_shift_pixels: float
+    boundary_lock_pixels: float
+    analysis_size: int
+    control_grid_size: int
+    optimization_steps: int
+    depth_weight: float
+    edge_weight: float
+    silhouette_weight: float
+    rigidity: float
+    confidence_threshold: float
+    source_depth_near_is_white: bool
+    target_depth_near_is_white: bool
+    background_threshold: float
+    output_mask_mode: str
+    confidence_gate_strength: float
+    source_depth_blur_pixels: float
+    fold_prevention_strength: float
+
+
+@dataclass(frozen=True)
+class HumanoidAlignSettings:
+    view: str
+    global_model: str
+    score_threshold: float
+    global_alignment_strength: float
+    torso_strength: float
+    arm_strength: float
+    leg_strength: float
+    head_strength: float
+    hand_strength: float
+    foot_strength: float
+    tps_regularization: float
+    max_local_shift_pixels: float
+    outer_stability: float
+    fold_protection: bool
+    max_folded_area_percent: float
+    background_threshold: float
+    output_mask_mode: str
+    source_person_index: int
+    target_person_index: int
 def parse_view_layer_order(value) -> tuple[str, str, str, str]:
     if isinstance(value, str):
         result = tuple(part.strip().lower() for part in value.split(">"))
@@ -1210,6 +1264,8 @@ def _validate_view_settings(settings, expected_view: str) -> ReprojectionViewSet
         raise ValueError(
             f"Unknown Gaussian blur target: {settings.gaussian_blur_target!r}"
         )
+    if settings.coverage_mode not in COVERAGE_MODES:
+        raise ValueError(f"Unknown coverage mode: {settings.coverage_mode!r}")
     return settings
 
 
@@ -1473,7 +1529,11 @@ def _warp_image_to_canvas(
     y_deformation_percent: float = 0.0,
 ) -> torch.Tensor:
     """Place an image on a square canvas with scale, translation and axis deformation."""
-    source = image[..., :3].float().clamp(0.0, 1.0)
+    if image.ndim != 3 or image.shape[-1] not in (3, 4):
+        raise ValueError("Warp input must be an RGB or RGBA image [H,W,3/4]")
+    # Keep alpha when it is available.  Auto Align used to discard it here,
+    # turning transparent padding into ordinary black pixels before reprojection.
+    source = image.float().clamp(0.0, 1.0)
     source_height, source_width = int(source.shape[0]), int(source.shape[1])
     dtype = source.dtype
     device = source.device
@@ -1495,6 +1555,1476 @@ def _warp_image_to_canvas(
         padding_mode="zeros",
         align_corners=False,
     ).movedim(1, -1)
+
+
+def _geometry_single_nchw(value: torch.Tensor, name: str) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor) or value.ndim != 4 or value.shape[0] != 1:
+        raise ValueError(f"{name} must be a single-item IMAGE batch [1,H,W,C]")
+    if value.shape[-1] < 1:
+        raise ValueError(f"{name} has no channels")
+    # ComfyUI executes nodes under torch.inference_mode().  A clone made while
+    # Geometry-Aware Align has locally disabled that mode converts incoming
+    # inference tensors into ordinary tensors that autograd may safely save for
+    # grid_sample's backward pass.
+    return value.detach().float().clone().movedim(-1, 1)
+
+
+def _geometry_optional_mask_nchw(
+    value: torch.Tensor | None,
+    name: str,
+    height: int,
+    width: int,
+) -> torch.Tensor | None:
+    if value is None:
+        return None
+    if not isinstance(value, torch.Tensor) or value.ndim != 3 or value.shape[0] != 1:
+        raise ValueError(f"{name} must be a single-item MASK batch [1,H,W]")
+    mask = value.detach().float().clone().unsqueeze(1).clamp(0.0, 1.0)
+    if tuple(mask.shape[-2:]) != (height, width):
+        mask = torch.nn.functional.interpolate(mask, size=(height, width), mode="nearest")
+    return mask
+
+
+def _geometry_gray_nchw(value: torch.Tensor) -> torch.Tensor:
+    if value.shape[1] == 1:
+        return value[:, :1]
+    rgb = value[:, :3]
+    weights = rgb.new_tensor((0.299, 0.587, 0.114)).view(1, 3, 1, 1)
+    return (rgb * weights).sum(dim=1, keepdim=True)
+
+
+def _geometry_normalize_depth(
+    depth: torch.Tensor,
+    mask: torch.Tensor,
+    near_is_white: bool,
+) -> tuple[torch.Tensor, float, float]:
+    value = _geometry_gray_nchw(depth).clamp(0.0, 1.0)
+    if not bool(near_is_white):
+        value = 1.0 - value
+    selected = value[mask > 0.5]
+    if selected.numel() < 16:
+        raise ValueError("Geometry-Aware Align depth mask contains too few valid pixels")
+    low = float(torch.quantile(selected, 0.01))
+    high = float(torch.quantile(selected, 0.99))
+    if high - low < 1e-5:
+        low = float(selected.amin())
+        high = float(selected.amax())
+    if high - low < 1e-5:
+        raise ValueError("Geometry-Aware Align depth has no usable variation inside its mask")
+    normalized = ((value - low) / (high - low)).clamp(0.0, 1.0) * mask
+    return normalized, low, high
+
+
+def _geometry_masked_blur(
+    value: torch.Tensor,
+    mask: torch.Tensor,
+    sigma_pixels: float,
+) -> torch.Tensor:
+    """Blur depth inside a mask without pulling black background into its edge."""
+    sigma = max(0.0, float(sigma_pixels))
+    if sigma <= 1e-6:
+        return value * mask
+    numerator = _gaussian_blur_nchw(value * mask, sigma, padding_mode="constant")
+    denominator = _gaussian_blur_nchw(mask, sigma, padding_mode="constant")
+    return (numerator / denominator.clamp_min(1e-5)).clamp(0.0, 1.0) * mask
+
+
+def _geometry_mask_bbox(mask: torch.Tensor) -> tuple[float, float, float, float]:
+    rows, cols = torch.nonzero(mask[0, 0] > 0.5, as_tuple=True)
+    if rows.numel() < 16:
+        raise ValueError("Geometry-Aware Align could not find a usable foreground mask")
+    return float(cols.min()), float(rows.min()), float(cols.max()), float(rows.max())
+
+
+def _geometry_base_grid(
+    source_mask: torch.Tensor,
+    target_mask: torch.Tensor,
+    fit_mode: str,
+    strength: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if fit_mode not in GEOMETRY_ALIGN_FIT_MODES:
+        raise ValueError(f"Unknown geometry align fit mode: {fit_mode!r}")
+    height, width = int(target_mask.shape[-2]), int(target_mask.shape[-1])
+    sx0, sy0, sx1, sy1 = _geometry_mask_bbox(source_mask)
+    tx0, ty0, tx1, ty1 = _geometry_mask_bbox(target_mask)
+    source_width = max(1.0, sx1 - sx0 + 1.0)
+    source_height = max(1.0, sy1 - sy0 + 1.0)
+    target_width = max(1.0, tx1 - tx0 + 1.0)
+    target_height = max(1.0, ty1 - ty0 + 1.0)
+    source_center_x = (sx0 + sx1) * 0.5
+    source_center_y = (sy0 + sy1) * 0.5
+    target_center_x = (tx0 + tx1) * 0.5
+    target_center_y = (ty0 + ty1) * 0.5
+    if fit_mode == "none":
+        requested_scale_x = requested_scale_y = 1.0
+        target_center_x = source_center_x
+        target_center_y = source_center_y
+    elif fit_mode == "contain":
+        uniform = min(target_width / source_width, target_height / source_height)
+        requested_scale_x = requested_scale_y = uniform
+    else:
+        requested_scale_x = target_width / source_width
+        requested_scale_y = target_height / source_height
+    amount = min(1.0, max(0.0, float(strength)))
+    scale_x = 1.0 + (requested_scale_x - 1.0) * amount
+    scale_y = 1.0 + (requested_scale_y - 1.0) * amount
+    placed_center_x = source_center_x + (target_center_x - source_center_x) * amount
+    placed_center_y = source_center_y + (target_center_y - source_center_y) * amount
+    axis_x = torch.arange(width, device=target_mask.device, dtype=torch.float32)
+    axis_y = torch.arange(height, device=target_mask.device, dtype=torch.float32)
+    yy, xx = torch.meshgrid(axis_y, axis_x, indexing="ij")
+    source_x = (xx - placed_center_x) / max(scale_x, 1e-6) + source_center_x
+    source_y = (yy - placed_center_y) / max(scale_y, 1e-6) + source_center_y
+    grid = torch.stack(
+        [
+            (source_x + 0.5) / float(width) * 2.0 - 1.0,
+            (source_y + 0.5) / float(height) * 2.0 - 1.0,
+        ],
+        dim=-1,
+    ).unsqueeze(0)
+    return grid, {
+        "scale_x": float(scale_x),
+        "scale_y": float(scale_y),
+        "offset_x": float(placed_center_x - source_center_x),
+        "offset_y": float(placed_center_y - source_center_y),
+    }
+
+
+def _geometry_edge_magnitude(value: torch.Tensor) -> torch.Tensor:
+    sobel_x = value.new_tensor(
+        [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]]
+    ).unsqueeze(0)
+    sobel_y = value.new_tensor(
+        [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]]
+    ).unsqueeze(0)
+    gx = torch.nn.functional.conv2d(value, sobel_x, padding=1)
+    gy = torch.nn.functional.conv2d(value, sobel_y, padding=1)
+    magnitude = torch.sqrt(gx.square() + gy.square() + 1e-8)
+    return magnitude / magnitude.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+
+
+def _geometry_grid_with_flow(base_grid: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
+    height, width = int(flow.shape[-2]), int(flow.shape[-1])
+    grid = base_grid.clone()
+    grid[..., 0] += flow[:, 0] * (2.0 / float(max(1, width - 1)))
+    grid[..., 1] += flow[:, 1] * (2.0 / float(max(1, height - 1)))
+    return grid
+
+
+def _geometry_warp(value: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.grid_sample(
+        value,
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=False,
+    )
+
+
+def _geometry_deformation_penalties(
+    flow: torch.Tensor,
+    base_scale_x: float,
+    base_scale_y: float,
+    max_shift_pixels: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return elastic strain, fold-over and bending penalties for a pixel flow.
+
+    A uniform translation has zero strain and bending.  Symmetric derivatives
+    penalise local stretching/shear while allowing rigid rotation.  The Jacobian
+    determinant term prevents the backward sampling map from folding over itself,
+    which otherwise produces the characteristic minced/smeared texture.
+    """
+    if flow.shape[-2] < 3 or flow.shape[-1] < 3:
+        zero = flow.new_zeros(())
+        return zero, zero, zero
+    u = flow[:, 0]
+    v = flow[:, 1]
+    du_dx = u[:, :-1, 1:] - u[:, :-1, :-1]
+    du_dy = u[:, 1:, :-1] - u[:, :-1, :-1]
+    dv_dx = v[:, :-1, 1:] - v[:, :-1, :-1]
+    dv_dy = v[:, 1:, :-1] - v[:, :-1, :-1]
+
+    normal_x = du_dx
+    normal_y = dv_dy
+    shear = 0.5 * (du_dy + dv_dx)
+    strain = (
+        normal_x.square().mean()
+        + normal_y.square().mean()
+        + 2.0 * shear.square().mean()
+    )
+
+    base_j00 = 1.0 / max(float(base_scale_x), 1e-6)
+    base_j11 = 1.0 / max(float(base_scale_y), 1e-6)
+    determinant = (
+        (base_j00 + du_dx) * (base_j11 + dv_dy) - du_dy * dv_dx
+    )
+    minimum_determinant = 0.20 * base_j00 * base_j11
+    fold = torch.relu(minimum_determinant - determinant).square().mean()
+
+    dx = flow[:, :, :, 1:] - flow[:, :, :, :-1]
+    dy = flow[:, :, 1:, :] - flow[:, :, :-1, :]
+    dxx = dx[:, :, :, 1:] - dx[:, :, :, :-1]
+    dyy = dy[:, :, 1:, :] - dy[:, :, :-1, :]
+    bending = dxx.square().mean() + dyy.square().mean()
+    magnitude = flow.square().mean() / max(float(max_shift_pixels) ** 2, 1.0)
+    elastic = strain + 0.25 * bending + 0.0025 * magnitude
+    return elastic, fold, determinant
+
+
+@torch.inference_mode(False)
+def geometry_aware_view_align(
+    image: torch.Tensor,
+    source_depth: torch.Tensor,
+    target_depth: torch.Tensor,
+    settings: GeometryAlignSettings,
+    source_mask: torch.Tensor | None = None,
+    target_mask: torch.Tensor | None = None,
+):
+    """Align one RGB view to rendered depth with a locally trainable flow grid.
+
+    ComfyUI wraps normal execution in ``torch.inference_mode()``.  The explicit
+    decorator is required because ``torch.enable_grad()`` alone only overrides
+    ``no_grad`` and cannot re-enable graph construction inside inference mode.
+    """
+    if not isinstance(settings, GeometryAlignSettings):
+        raise ValueError("settings must come from Pixal3D Geometry Align Settings")
+    source_image = _geometry_single_nchw(image, "image")
+    source_depth_nchw = _geometry_single_nchw(source_depth, "source_depth")
+    target_depth_nchw = _geometry_single_nchw(target_depth, "target_depth")
+    target_height, target_width = (
+        int(target_depth_nchw.shape[-2]),
+        int(target_depth_nchw.shape[-1]),
+    )
+    if source_image.shape[1] < 3:
+        source_image = source_image.repeat(1, 3, 1, 1)
+    source_alpha = source_image[:, 3:4] if source_image.shape[1] >= 4 else None
+    source_rgb = source_image[:, :3].clamp(0.0, 1.0)
+    source_height, source_width = int(source_rgb.shape[-2]), int(source_rgb.shape[-1])
+    source_mask_nchw = _geometry_optional_mask_nchw(
+        source_mask, "source_mask", source_height, source_width
+    )
+    if source_mask_nchw is None:
+        if source_alpha is not None:
+            source_mask_nchw = source_alpha.clamp(0.0, 1.0)
+        else:
+            source_mask_nchw = (
+                source_rgb.amax(dim=1, keepdim=True)
+                > float(settings.background_threshold)
+            ).float()
+    target_mask_nchw = _geometry_optional_mask_nchw(
+        target_mask, "target_mask", target_height, target_width
+    )
+    if target_mask_nchw is None:
+        target_gray_raw = _geometry_gray_nchw(target_depth_nchw)
+        target_mask_nchw = (
+            target_gray_raw > float(settings.background_threshold)
+        ).float()
+
+    if tuple(source_rgb.shape[-2:]) != (target_height, target_width):
+        source_rgb = torch.nn.functional.interpolate(
+            source_rgb, size=(target_height, target_width), mode="bilinear", align_corners=False
+        )
+        source_depth_nchw = torch.nn.functional.interpolate(
+            source_depth_nchw,
+            size=(target_height, target_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        source_mask_nchw = torch.nn.functional.interpolate(
+            source_mask_nchw, size=(target_height, target_width), mode="nearest"
+        )
+    elif tuple(source_depth_nchw.shape[-2:]) != (target_height, target_width):
+        source_depth_nchw = torch.nn.functional.interpolate(
+            source_depth_nchw,
+            size=(target_height, target_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+    if source_mask_nchw.sum() < 16 or target_mask_nchw.sum() < 16:
+        raise ValueError("Geometry-Aware Align requires non-empty source and target masks")
+    if source_rgb.is_cuda:
+        device = source_rgb.device
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = source_rgb.device
+    source_rgb = source_rgb.to(device)
+    source_depth_nchw = source_depth_nchw.to(device)
+    target_depth_nchw = target_depth_nchw.to(device)
+    source_mask_nchw = source_mask_nchw.to(device)
+    target_mask_nchw = target_mask_nchw.to(device)
+    source_depth_normalized, source_low, source_high = _geometry_normalize_depth(
+        source_depth_nchw,
+        source_mask_nchw,
+        settings.source_depth_near_is_white,
+    )
+    target_depth_normalized, target_low, target_high = _geometry_normalize_depth(
+        target_depth_nchw,
+        target_mask_nchw,
+        settings.target_depth_near_is_white,
+    )
+    source_depth_normalized = _geometry_masked_blur(
+        source_depth_normalized,
+        source_mask_nchw,
+        settings.source_depth_blur_pixels,
+    )
+
+    longest = max(target_height, target_width)
+    analysis_scale = min(1.0, float(settings.analysis_size) / float(longest))
+    analysis_height = max(32, int(round(target_height * analysis_scale)))
+    analysis_width = max(32, int(round(target_width * analysis_scale)))
+    source_depth_analysis = torch.nn.functional.interpolate(
+        source_depth_normalized,
+        size=(analysis_height, analysis_width),
+        mode="bilinear",
+        align_corners=False,
+    )
+    target_depth_analysis = torch.nn.functional.interpolate(
+        target_depth_normalized,
+        size=(analysis_height, analysis_width),
+        mode="bilinear",
+        align_corners=False,
+    )
+    source_mask_analysis = torch.nn.functional.interpolate(
+        source_mask_nchw, size=(analysis_height, analysis_width), mode="nearest"
+    )
+    target_mask_analysis = torch.nn.functional.interpolate(
+        target_mask_nchw, size=(analysis_height, analysis_width), mode="nearest"
+    )
+    base_grid_analysis, _analysis_transform = _geometry_base_grid(
+        source_mask_analysis,
+        target_mask_analysis,
+        settings.global_fit_mode,
+        settings.global_alignment_strength,
+    )
+    boundary_width = float(settings.boundary_lock_pixels) * analysis_scale
+    if boundary_width > 1e-6:
+        interior_gate = _inner_edge_feather_mask(target_mask_analysis, boundary_width)
+        interior_gate = ((interior_gate - 0.5) * 2.0).clamp(0.0, 1.0)
+    else:
+        # Do not cut the displacement field off at the silhouette.  A hard
+        # target-mask multiplication creates a flow discontinuity exactly where
+        # arms and other outline parts must move, and can smear their texture.
+        interior_gate = torch.ones_like(target_mask_analysis)
+    target_edge = _geometry_edge_magnitude(target_depth_analysis)
+    max_shift_analysis = max(0.0, float(settings.max_local_shift_pixels) * analysis_scale)
+    grid_size = min(
+        int(settings.control_grid_size), analysis_height, analysis_width
+    )
+    raw_flow = torch.zeros(
+        (1, 2, grid_size, grid_size), device=device, dtype=torch.float32, requires_grad=True
+    )
+
+    def evaluated_flow() -> torch.Tensor:
+        if max_shift_analysis <= 1e-6:
+            return torch.zeros(
+                (1, 2, analysis_height, analysis_width), device=device, dtype=torch.float32
+            )
+        control = torch.tanh(raw_flow) * max_shift_analysis
+        dense = torch.nn.functional.interpolate(
+            control,
+            size=(analysis_height, analysis_width),
+            mode="bicubic",
+            align_corners=False,
+        )
+        return dense * interior_gate
+
+    def alignment_loss(flow: torch.Tensor):
+        grid = _geometry_grid_with_flow(base_grid_analysis, flow)
+        warped_depth = _geometry_warp(source_depth_analysis, grid)
+        warped_mask = _geometry_warp(source_mask_analysis, grid).clamp(0.0, 1.0)
+        overlap = target_mask_analysis * warped_mask
+        denominator = overlap.sum().clamp_min(1.0)
+        residual = warped_depth - target_depth_analysis
+        depth_loss = (torch.sqrt(residual.square() + 1e-6) * overlap).sum() / denominator
+        warped_edge = _geometry_edge_magnitude(warped_depth)
+        edge_loss = (
+            (warped_edge - target_edge).abs() * target_mask_analysis
+        ).sum() / target_mask_analysis.sum().clamp_min(1.0)
+        # Full-image averaging made small limbs nearly irrelevant on padded
+        # 1024/2048 canvases.  Union normalisation gives hands, ears and feet a
+        # useful influence independent of the amount of surrounding padding.
+        silhouette_error = (warped_mask - target_mask_analysis).abs()
+        silhouette_union = torch.maximum(
+            warped_mask.detach(), target_mask_analysis
+        ).sum().clamp_min(1.0)
+        silhouette_loss = silhouette_error.sum() / silhouette_union
+        regularization, fold_penalty, _determinant = _geometry_deformation_penalties(
+            flow,
+            _analysis_transform["scale_x"],
+            _analysis_transform["scale_y"],
+            max_shift_analysis,
+        )
+        total = (
+            float(settings.depth_weight) * depth_loss
+            + float(settings.edge_weight) * edge_loss
+            + float(settings.silhouette_weight) * silhouette_loss
+            + float(settings.rigidity) * regularization
+            + float(settings.fold_prevention_strength) * fold_penalty
+        )
+        return (
+            total,
+            depth_loss,
+            edge_loss,
+            silhouette_loss,
+            regularization,
+            fold_penalty,
+            warped_depth,
+            warped_mask,
+        )
+
+    with torch.enable_grad():
+        initial = alignment_loss(evaluated_flow())
+        initial_loss = float(initial[0].detach())
+        if (
+            int(settings.optimization_steps) > 0
+            and float(settings.local_alignment_strength) > 0.0
+            and max_shift_analysis > 1e-6
+        ):
+            optimizer = torch.optim.Adam((raw_flow,), lr=0.035)
+            for _ in range(int(settings.optimization_steps)):
+                optimizer.zero_grad(set_to_none=True)
+                loss = alignment_loss(evaluated_flow())[0]
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_((raw_flow,), 5.0)
+                optimizer.step()
+        optimized_flow = evaluated_flow()
+        final_terms = alignment_loss(optimized_flow)
+
+    with torch.no_grad():
+        final_loss = float(final_terms[0])
+        warped_depth_analysis = final_terms[6]
+        warped_mask_analysis = final_terms[7]
+        residual = (warped_depth_analysis - target_depth_analysis).abs()
+        confidence = (
+            torch.exp(-6.0 * residual)
+            * target_mask_analysis
+            * warped_mask_analysis
+        ).clamp(0.0, 1.0)
+        confidence = _gaussian_blur_nchw(confidence, 1.0).clamp(0.0, 1.0)
+        threshold = min(0.95, max(0.0, float(settings.confidence_threshold)))
+        if threshold > 0.0:
+            confidence = ((confidence - threshold) / (1.0 - threshold)).clamp(0.0, 1.0)
+        gate_strength = min(
+            1.0, max(0.0, float(settings.confidence_gate_strength))
+        )
+        # Confidence is primarily diagnostic.  The old unconditional
+        # multiplication suppressed precisely the large-mismatch areas that
+        # needed deformation most.  This optional gate blends continuously
+        # from full solved flow (0) to the old conservative behaviour (1).
+        confidence_gate = 1.0 - gate_strength * (1.0 - confidence)
+        effective_flow_analysis = (
+            optimized_flow
+            * min(1.0, max(0.0, float(settings.local_alignment_strength)))
+            * confidence_gate
+        )
+        flow_full = torch.nn.functional.interpolate(
+            effective_flow_analysis,
+            size=(target_height, target_width),
+            mode="bicubic",
+            align_corners=False,
+        )
+        flow_full[:, 0] *= float(target_width) / float(analysis_width)
+        flow_full[:, 1] *= float(target_height) / float(analysis_height)
+        confidence_full = torch.nn.functional.interpolate(
+            confidence,
+            size=(target_height, target_width),
+            mode="bilinear",
+            align_corners=False,
+        ).clamp(0.0, 1.0)
+        base_grid_full, transform = _geometry_base_grid(
+            source_mask_nchw,
+            target_mask_nchw,
+            settings.global_fit_mode,
+            settings.global_alignment_strength,
+        )
+        final_grid = _geometry_grid_with_flow(base_grid_full, flow_full)
+        aligned_rgb = _geometry_warp(source_rgb, final_grid).clamp(0.0, 1.0)
+        aligned_source_mask = _geometry_warp(source_mask_nchw, final_grid).clamp(0.0, 1.0)
+        aligned_depth = _geometry_warp(source_depth_normalized, final_grid).clamp(0.0, 1.0)
+        if settings.output_mask_mode == "target":
+            output_mask = target_mask_nchw
+        elif settings.output_mask_mode == "intersection":
+            output_mask = target_mask_nchw * aligned_source_mask
+        elif settings.output_mask_mode == "warped_source":
+            output_mask = aligned_source_mask
+        else:
+            raise ValueError(f"Unknown geometry output mask mode: {settings.output_mask_mode!r}")
+        output_mask = output_mask.clamp(0.0, 1.0)
+        aligned_rgb = aligned_rgb * output_mask
+        aligned_rgba = torch.cat((aligned_rgb, output_mask), dim=1)
+        aligned_depth_image = aligned_depth.repeat(1, 3, 1, 1) * output_mask
+        max_shift = max(float(settings.max_local_shift_pixels), 1.0)
+        flow_preview = torch.stack(
+            (
+                (0.5 + flow_full[:, 0] / (2.0 * max_shift)).clamp(0.0, 1.0),
+                (0.5 + flow_full[:, 1] / (2.0 * max_shift)).clamp(0.0, 1.0),
+                confidence_full[:, 0],
+            ),
+            dim=1,
+        ) * target_mask_nchw
+        warped_edge_full = _geometry_edge_magnitude(aligned_depth)
+        target_edge_full = _geometry_edge_magnitude(target_depth_normalized)
+        overlay = (aligned_rgb * 0.35).clamp(0.0, 1.0)
+        overlay[:, 0:1] = torch.maximum(overlay[:, 0:1], warped_edge_full)
+        overlay[:, 1:2] = torch.maximum(overlay[:, 1:2], target_edge_full)
+        overlay[:, 2:3] = torch.maximum(overlay[:, 2:3], warped_edge_full)
+        flow_magnitude = torch.linalg.vector_norm(flow_full, dim=1)
+        _elastic_full, _fold_full, determinant_full = _geometry_deformation_penalties(
+            flow_full,
+            transform["scale_x"],
+            transform["scale_y"],
+            float(settings.max_local_shift_pixels),
+        )
+        active = target_mask_nchw[:, 0] > 0.5
+        mean_flow = float(flow_magnitude[active].mean()) if torch.any(active) else 0.0
+        max_flow = float(flow_magnitude.max())
+        mean_confidence = float(confidence_full[:, 0][active].mean()) if torch.any(active) else 0.0
+        target_coverage = float(
+            (aligned_source_mask * target_mask_nchw).sum()
+            / target_mask_nchw.sum().clamp_min(1.0)
+        )
+        source_mask_area = float((source_mask_nchw > 0.5).float().mean())
+        target_mask_area = float((target_mask_nchw > 0.5).float().mean())
+        determinant_active = determinant_full[active[:, :-1, :-1]]
+        folded_fraction = (
+            float((determinant_active <= 0.0).float().mean())
+            if determinant_active.numel()
+            else 0.0
+        )
+        mask_warning = (
+            "WARNING: source_mask covers over 85% of the frame; verify that 1=object, not transparent background"
+            if source_mask_area > 0.85
+            else "source_mask polarity looks plausible"
+        )
+        report = "\n".join(
+            (
+                "Pixal3D geometry-aware view alignment",
+                f"view={settings.view}, output={target_width}x{target_height}, analysis={analysis_width}x{analysis_height}, grid={grid_size}x{grid_size}",
+                f"global_fit={settings.global_fit_mode}, strength={settings.global_alignment_strength:.3f}, scale={transform['scale_x']:.5f}/{transform['scale_y']:.5f}, offset={transform['offset_x']:.2f}/{transform['offset_y']:.2f}px",
+                f"local_strength={settings.local_alignment_strength:.3f}, max_shift={settings.max_local_shift_pixels:.2f}px, boundary_lock={settings.boundary_lock_pixels:.2f}px, steps={settings.optimization_steps}",
+                f"loss={initial_loss:.6f}->{final_loss:.6f}, depth={float(final_terms[1]):.6f}, edge={float(final_terms[2]):.6f}, silhouette={float(final_terms[3]):.6f}",
+                f"deformation: elastic={float(final_terms[4]):.6f}, fold_penalty={float(final_terms[5]):.6f}, folded_pixels={folded_fraction:.4%}",
+                f"flow_mean={mean_flow:.3f}px, flow_max={max_flow:.3f}px, target_coverage={target_coverage:.2%}",
+                f"confidence_mean={mean_confidence:.4f}, confidence_threshold={settings.confidence_threshold:.3f}, confidence_gate_strength={gate_strength:.3f}",
+                f"mask_area: source={source_mask_area:.2%}, target={target_mask_area:.2%}; {mask_warning}",
+                f"source_depth_range={source_low:.5f}..{source_high:.5f}, target_depth_range={target_low:.5f}..{target_high:.5f}, output_mask={settings.output_mask_mode}",
+                "overlay: warped source depth edges=magenta, target model depth edges=green; white means agreement",
+            )
+        )
+    return (
+        aligned_rgb.movedim(1, -1).cpu(),
+        aligned_rgba.movedim(1, -1).cpu(),
+        output_mask[:, 0].cpu(),
+        aligned_depth_image.movedim(1, -1).cpu(),
+        confidence_full[:, 0].cpu(),
+        flow_preview.movedim(1, -1).cpu(),
+        overlay.movedim(1, -1).cpu(),
+        report,
+    )
+
+
+_HUMANOID_BODY_NAMES = (
+    "nose", "neck", "right_shoulder", "right_elbow", "right_wrist",
+    "left_shoulder", "left_elbow", "left_wrist", "right_hip", "right_knee",
+    "right_ankle", "left_hip", "left_knee", "left_ankle", "right_eye",
+    "left_eye", "right_ear", "left_ear",
+)
+_HUMANOID_BODY_GROUPS = (
+    "head", "torso", "arms", "arms", "arms", "arms", "arms", "arms",
+    "torso", "legs", "legs", "torso", "legs", "legs", "head", "head",
+    "head", "head",
+)
+
+
+def _humanoid_pose_person(frame, requested_index: int, threshold: float, label: str):
+    if not isinstance(frame, dict):
+        raise ValueError(f"{label} POSE_KEYPOINT frame must be a dictionary")
+    people = frame.get("people") or []
+    if not people:
+        raise ValueError(f"{label} POSE_KEYPOINT contains no detected people")
+    index = int(requested_index)
+    if index >= 0:
+        if index >= len(people):
+            raise ValueError(
+                f"{label} person_index={index} is outside the {len(people)} detected people"
+            )
+        return people[index], index
+
+    best_index = 0
+    best_area = -1.0
+    for candidate_index, person in enumerate(people):
+        raw = person.get("pose_keypoints_2d") or []
+        if len(raw) < 3:
+            continue
+        points = torch.as_tensor(raw, dtype=torch.float32).reshape(-1, 3)
+        valid = (
+            (points[:, 2] >= float(threshold))
+            & (points[:, 0] >= 0.0)
+            & (points[:, 1] >= 0.0)
+        )
+        selected = points[valid, :2]
+        if selected.shape[0] < 2:
+            area = 0.0
+        else:
+            span = selected.amax(dim=0) - selected.amin(dim=0)
+            area = float(span[0] * span[1])
+        if area > best_area:
+            best_area = area
+            best_index = candidate_index
+    return people[best_index], best_index
+
+
+def _humanoid_pose_array(person, key: str, count: int) -> torch.Tensor:
+    raw = person.get(key) or []
+    if not raw:
+        return torch.zeros((count, 3), dtype=torch.float32)
+    value = torch.as_tensor(raw, dtype=torch.float32).reshape(-1, 3)
+    if value.shape[0] < count:
+        value = torch.cat((value, value.new_zeros((count - value.shape[0], 3))), dim=0)
+    return value[:count]
+
+
+def _humanoid_pose_frame(value, label: str):
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(
+            f"{label} must be POSE_KEYPOINT from ComfyUI SDPose Keypoint Extractor"
+        )
+    frame = value[0]
+    width = int(frame.get("canvas_width", 0)) if isinstance(frame, dict) else 0
+    height = int(frame.get("canvas_height", 0)) if isinstance(frame, dict) else 0
+    if width <= 0 or height <= 0:
+        raise ValueError(f"{label} POSE_KEYPOINT has an invalid canvas size")
+    return frame, width, height
+
+
+def _humanoid_common_landmarks(
+    source_pose,
+    target_pose,
+    settings: HumanoidAlignSettings,
+):
+    source_frame, source_width, source_height = _humanoid_pose_frame(
+        source_pose, "source_pose"
+    )
+    target_frame, target_width, target_height = _humanoid_pose_frame(
+        target_pose, "target_pose"
+    )
+    source_person, source_index = _humanoid_pose_person(
+        source_frame,
+        settings.source_person_index,
+        settings.score_threshold,
+        "source",
+    )
+    target_person, target_index = _humanoid_pose_person(
+        target_frame,
+        settings.target_person_index,
+        settings.score_threshold,
+        "target",
+    )
+    threshold = float(settings.score_threshold)
+    source_points = []
+    target_points = []
+    names = []
+    groups = []
+
+    def append_common(source_array, target_array, point_names, point_groups, indices=None):
+        use_indices = range(len(point_names)) if indices is None else indices
+        for index in use_indices:
+            source_point = source_array[index]
+            target_point = target_array[index]
+            valid = (
+                float(source_point[2]) >= threshold
+                and float(target_point[2]) >= threshold
+                and bool(torch.isfinite(source_point).all())
+                and bool(torch.isfinite(target_point).all())
+                and float(source_point[0]) >= 0.0
+                and float(source_point[1]) >= 0.0
+                and float(target_point[0]) >= 0.0
+                and float(target_point[1]) >= 0.0
+            )
+            if valid:
+                source_points.append(
+                    torch.tensor(
+                        (
+                            float(source_point[0]) / max(1.0, source_width - 1.0),
+                            float(source_point[1]) / max(1.0, source_height - 1.0),
+                        )
+                    )
+                )
+                target_points.append(
+                    torch.tensor(
+                        (
+                            float(target_point[0]) / max(1.0, target_width - 1.0),
+                            float(target_point[1]) / max(1.0, target_height - 1.0),
+                        )
+                    )
+                )
+                names.append(point_names[index])
+                groups.append(point_groups[index])
+
+    source_body = _humanoid_pose_array(source_person, "pose_keypoints_2d", 18)
+    target_body = _humanoid_pose_array(target_person, "pose_keypoints_2d", 18)
+    append_common(
+        source_body,
+        target_body,
+        _HUMANOID_BODY_NAMES,
+        _HUMANOID_BODY_GROUPS,
+    )
+
+    foot_names = tuple(f"foot_{index}" for index in range(6))
+    foot_groups = ("feet",) * 6
+    append_common(
+        _humanoid_pose_array(source_person, "foot_keypoints_2d", 6),
+        _humanoid_pose_array(target_person, "foot_keypoints_2d", 6),
+        foot_names,
+        foot_groups,
+    )
+
+    # A compact hand subset keeps fingers from over-constraining the body warp.
+    hand_indices = (5, 9, 13, 17, 8, 12, 16, 20)
+    for side, key in (
+        ("right", "hand_right_keypoints_2d"),
+        ("left", "hand_left_keypoints_2d"),
+    ):
+        hand_names = tuple(f"{side}_hand_{index}" for index in range(21))
+        append_common(
+            _humanoid_pose_array(source_person, key, 21),
+            _humanoid_pose_array(target_person, key, 21),
+            hand_names,
+            ("hands",) * 21,
+            hand_indices,
+        )
+
+    if len(source_points) < 3:
+        raise ValueError(
+            "Humanoid Pose Align needs at least three common source/target body "
+            "keypoints. Lower score_threshold or improve the target character render."
+        )
+    source = torch.stack(source_points).float()
+    target = torch.stack(target_points).float()
+    return source, target, names, groups, source_index, target_index
+
+
+def _humanoid_fit_affine(
+    target: torch.Tensor,
+    source: torch.Tensor,
+    mode: str,
+) -> torch.Tensor:
+    """Return [3,2] coefficients mapping normalized target points to source."""
+    if mode == "affine":
+        design = torch.cat((torch.ones((target.shape[0], 1)), target), dim=1)
+        return torch.linalg.lstsq(design, source).solution[:3]
+    if mode != "similarity":
+        raise ValueError(f"Unknown humanoid global model: {mode!r}")
+    target_mean = target.mean(dim=0)
+    source_mean = source.mean(dim=0)
+    target_centered = target - target_mean
+    source_centered = source - source_mean
+    u, _singular, vh = torch.linalg.svd(target_centered.T @ source_centered)
+    rotation = u @ vh
+    if float(torch.linalg.det(rotation)) < 0.0:
+        u = u.clone()
+        u[:, -1] *= -1.0
+        rotation = u @ vh
+    rotated = target_centered @ rotation
+    scale = float(
+        (rotated * source_centered).sum()
+        / target_centered.square().sum().clamp_min(1e-8)
+    )
+    linear = rotation * scale
+    offset = source_mean - target_mean @ linear
+    return torch.cat((offset.view(1, 2), linear), dim=0)
+
+
+def _humanoid_apply_affine(points: torch.Tensor, coefficients: torch.Tensor):
+    return torch.cat((torch.ones((points.shape[0], 1)), points), dim=1) @ coefficients
+
+
+def _humanoid_mask_base_coefficients(
+    source_mask: torch.Tensor,
+    target_mask: torch.Tensor,
+    source_width: int,
+    source_height: int,
+    target_width: int,
+    target_height: int,
+    mode: str,
+    strength: float,
+) -> torch.Tensor:
+    """Stable target->source affine fit derived from complete silhouettes.
+
+    Pose points are deliberately not used for global framing: a side-view detector
+    can return only a face or a foot, whose tiny bounding box would otherwise crop
+    and magnify the entire character before TPS even starts.
+    """
+    sx0, sy0, sx1, sy1 = _geometry_mask_bbox(source_mask)
+    tx0, ty0, tx1, ty1 = _geometry_mask_bbox(target_mask)
+    source_bbox_width = max(1.0, sx1 - sx0 + 1.0)
+    source_bbox_height = max(1.0, sy1 - sy0 + 1.0)
+    target_bbox_width = max(1.0, tx1 - tx0 + 1.0)
+    target_bbox_height = max(1.0, ty1 - ty0 + 1.0)
+    if mode == "similarity":
+        uniform = min(
+            target_bbox_width / source_bbox_width,
+            target_bbox_height / source_bbox_height,
+        )
+        scale_x = scale_y = uniform
+    elif mode == "affine":
+        scale_x = target_bbox_width / source_bbox_width
+        scale_y = target_bbox_height / source_bbox_height
+    else:
+        raise ValueError(f"Unknown humanoid global model: {mode!r}")
+    source_center_x = 0.5 * (sx0 + sx1)
+    source_center_y = 0.5 * (sy0 + sy1)
+    target_center_x = 0.5 * (tx0 + tx1)
+    target_center_y = 0.5 * (ty0 + ty1)
+    coefficients = torch.tensor(
+        [
+            [
+                (source_center_x - target_center_x / scale_x)
+                / max(1.0, source_width - 1.0),
+                (source_center_y - target_center_y / scale_y)
+                / max(1.0, source_height - 1.0),
+            ],
+            [
+                max(1.0, target_width - 1.0)
+                / (scale_x * max(1.0, source_width - 1.0)),
+                0.0,
+            ],
+            [
+                0.0,
+                max(1.0, target_height - 1.0)
+                / (scale_y * max(1.0, source_height - 1.0)),
+            ],
+        ],
+        dtype=torch.float32,
+    )
+    identity = torch.tensor(
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=torch.float32
+    )
+    amount = min(1.0, max(0.0, float(strength)))
+    return identity + amount * (coefficients - identity)
+
+
+def _humanoid_tps_solve(
+    controls: torch.Tensor,
+    residuals: torch.Tensor,
+    regularization: float,
+):
+    count = controls.shape[0]
+    squared = torch.cdist(controls, controls).square()
+    kernel = squared * torch.log(squared.clamp_min(1e-8))
+    kernel.diagonal().zero_()
+    affine = torch.cat((torch.ones((count, 1)), controls), dim=1)
+    system = torch.zeros((count + 3, count + 3), dtype=torch.float32)
+    system[:count, :count] = kernel
+    system[:count, :count] += torch.eye(count) * max(0.0, float(regularization))
+    system[:count, count:] = affine
+    system[count:, :count] = affine.T
+    right = torch.cat((residuals, torch.zeros((3, 2))), dim=0)
+    try:
+        solution = torch.linalg.solve(system, right)
+    except RuntimeError:
+        solution = torch.linalg.lstsq(system, right).solution
+    return solution[:count], solution[count:]
+
+
+def _humanoid_tps_evaluate(
+    points: torch.Tensor,
+    controls: torch.Tensor,
+    radial_weights: torch.Tensor,
+    affine_weights: torch.Tensor,
+):
+    squared = torch.cdist(points, controls).square()
+    kernel = squared * torch.log(squared.clamp_min(1e-8))
+    design = torch.cat((torch.ones((points.shape[0], 1)), points), dim=1)
+    return kernel @ radial_weights + design @ affine_weights
+
+
+def _humanoid_frame_anchors(amount: float) -> torch.Tensor:
+    if float(amount) <= 1e-6:
+        return torch.empty((0, 2), dtype=torch.float32)
+    per_edge = 2 + int(round(4.0 * min(1.0, max(0.0, float(amount)))))
+    values = torch.linspace(0.0, 1.0, per_edge + 2)
+    points = []
+    for value in values:
+        scalar = float(value)
+        points.extend(((scalar, 0.0), (scalar, 1.0)))
+    for value in values[1:-1]:
+        scalar = float(value)
+        points.extend(((0.0, scalar), (1.0, scalar)))
+    return torch.tensor(points, dtype=torch.float32)
+
+
+def _humanoid_mapping_grid(
+    target_height: int,
+    target_width: int,
+    source_height: int,
+    source_width: int,
+    base_coefficients: torch.Tensor,
+    controls: torch.Tensor,
+    radial_weights: torch.Tensor,
+    affine_weights: torch.Tensor,
+    max_local_shift_pixels: float,
+):
+    rows = []
+    x_values = torch.linspace(0.0, 1.0, target_width)
+    for start in range(0, target_height, 128):
+        end = min(target_height, start + 128)
+        y_values = torch.linspace(0.0, 1.0, target_height)[start:end]
+        yy, xx = torch.meshgrid(y_values, x_values, indexing="ij")
+        target_points = torch.stack((xx, yy), dim=-1).reshape(-1, 2)
+        base = _humanoid_apply_affine(target_points, base_coefficients)
+        residual = _humanoid_tps_evaluate(
+            target_points, controls, radial_weights, affine_weights
+        )
+        if float(max_local_shift_pixels) > 0.0:
+            residual_pixels = residual * residual.new_tensor(
+                (max(1, source_width - 1), max(1, source_height - 1))
+            )
+            magnitude = torch.linalg.vector_norm(residual_pixels, dim=1, keepdim=True)
+            residual *= (
+                float(max_local_shift_pixels) / magnitude.clamp_min(1e-8)
+            ).clamp(max=1.0)
+        rows.append(torch.cat((base, residual), dim=1).reshape(end - start, target_width, 4))
+    packed = torch.cat(rows, dim=0)
+    return packed[..., :2], packed[..., 2:]
+
+
+def _humanoid_fold_fraction(
+    source_coordinates: torch.Tensor,
+    target_mask: torch.Tensor,
+    source_width: int,
+    source_height: int,
+):
+    source_x = source_coordinates[..., 0] * max(1, source_width - 1)
+    source_y = source_coordinates[..., 1] * max(1, source_height - 1)
+    dx_x = source_x[:-1, 1:] - source_x[:-1, :-1]
+    dy_x = source_y[:-1, 1:] - source_y[:-1, :-1]
+    dx_y = source_x[1:, :-1] - source_x[:-1, :-1]
+    dy_y = source_y[1:, :-1] - source_y[:-1, :-1]
+    determinant = dx_x * dy_y - dx_y * dy_x
+    active = target_mask[0, 0, :-1, :-1] > 0.05
+    if not bool(active.any()):
+        active = torch.ones_like(determinant, dtype=torch.bool)
+    folded = float((determinant[active] <= 0.0).float().mean())
+    return folded, determinant
+
+
+def _humanoid_landmark_overlay(
+    target_reference: torch.Tensor,
+    target_points: torch.Tensor,
+    source_points: torch.Tensor,
+    base_coefficients: torch.Tensor,
+):
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    image = target_reference[0, ..., :3].detach().float().cpu().clamp(0.0, 1.0)
+    array = (image.numpy() * 255.0 + 0.5).astype(np.uint8)
+    canvas = Image.fromarray(array, mode="RGB")
+    draw = ImageDraw.Draw(canvas)
+    height, width = array.shape[:2]
+    linear = base_coefficients[1:]
+    try:
+        inverse = torch.linalg.inv(linear)
+        initial_target = (source_points - base_coefficients[0]) @ inverse
+    except RuntimeError:
+        initial_target = target_points
+    radius = max(2, int(round(max(height, width) / 256.0)))
+    for predicted, target in zip(initial_target, target_points):
+        px = float(predicted[0]) * max(1, width - 1)
+        py = float(predicted[1]) * max(1, height - 1)
+        tx = float(target[0]) * max(1, width - 1)
+        ty = float(target[1]) * max(1, height - 1)
+        draw.line((px, py, tx, ty), fill=(255, 210, 0), width=max(1, radius // 2))
+        draw.ellipse((px - radius, py - radius, px + radius, py + radius), fill=(255, 0, 255))
+        draw.ellipse((tx - radius, ty - radius, tx + radius, ty + radius), fill=(0, 255, 96))
+    output = torch.from_numpy(np.asarray(canvas, dtype=np.float32).copy()).div_(255.0)
+    return output.unsqueeze(0)
+
+
+def humanoid_pose_view_align(
+    image: torch.Tensor,
+    source_pose,
+    target_reference: torch.Tensor,
+    target_pose,
+    settings: HumanoidAlignSettings,
+    source_mask: torch.Tensor | None = None,
+    target_mask: torch.Tensor | None = None,
+):
+    """Warp a character view from explicit source/target anatomical landmarks."""
+    if not isinstance(settings, HumanoidAlignSettings):
+        raise ValueError("settings must come from Pixal3D Humanoid Align Settings")
+    source_nchw = _geometry_single_nchw(image, "image")
+    reference_nchw = _geometry_single_nchw(target_reference, "target_reference")
+    if source_nchw.shape[1] < 3 or reference_nchw.shape[1] < 3:
+        raise ValueError("Humanoid Pose Align requires RGB source and target_reference images")
+    source_rgb = source_nchw[:, :3].clamp(0.0, 1.0)
+    source_height, source_width = int(source_rgb.shape[-2]), int(source_rgb.shape[-1])
+    target_height, target_width = int(reference_nchw.shape[-2]), int(reference_nchw.shape[-1])
+    source_mask_nchw = _geometry_optional_mask_nchw(
+        source_mask, "source_mask", source_height, source_width
+    )
+    if source_mask_nchw is None:
+        source_mask_nchw = (
+            source_nchw[:, 3:4].clamp(0.0, 1.0)
+            if source_nchw.shape[1] >= 4
+            else (source_rgb.amax(dim=1, keepdim=True) > settings.background_threshold).float()
+        )
+    target_mask_nchw = _geometry_optional_mask_nchw(
+        target_mask, "target_mask", target_height, target_width
+    )
+    if target_mask_nchw is None:
+        target_mask_nchw = (
+            reference_nchw[:, 3:4].clamp(0.0, 1.0)
+            if reference_nchw.shape[1] >= 4
+            else (
+                reference_nchw[:, :3].amax(dim=1, keepdim=True)
+                > settings.background_threshold
+            ).float()
+        )
+    source_points, target_points, names, groups, source_person, target_person = (
+        _humanoid_common_landmarks(source_pose, target_pose, settings)
+    )
+    counts = {
+        name: groups.count(name)
+        for name in ("head", "torso", "arms", "legs", "hands", "feet")
+    }
+    if settings.view in ("left", "right"):
+        anatomy_valid = counts["torso"] >= 2 and counts["arms"] >= 2 and counts["legs"] >= 2
+    else:
+        anatomy_valid = counts["torso"] >= 2 and counts["arms"] >= 4 and counts["legs"] >= 4
+    base_coefficients = _humanoid_mask_base_coefficients(
+        source_mask_nchw,
+        target_mask_nchw,
+        source_width,
+        source_height,
+        target_width,
+        target_height,
+        settings.global_model,
+        settings.global_alignment_strength,
+    )
+    base_at_landmarks = _humanoid_apply_affine(target_points, base_coefficients)
+    group_strength = {
+        "torso": settings.torso_strength,
+        "arms": settings.arm_strength,
+        "legs": settings.leg_strength,
+        "head": settings.head_strength,
+        "hands": settings.hand_strength,
+        "feet": settings.foot_strength,
+    }
+    strengths = torch.tensor([float(group_strength[group]) for group in groups]).unsqueeze(1)
+    if not anatomy_valid:
+        # A partial face/foot hallucination is not an anatomical target.  Keep
+        # the full silhouette fit but disable local TPS instead of distorting
+        # or cropping the source around the few detected points.
+        strengths.zero_()
+    landmark_residuals = (source_points - base_at_landmarks) * strengths
+    frame_anchors = _humanoid_frame_anchors(settings.outer_stability)
+    if frame_anchors.numel():
+        controls = torch.cat((target_points, frame_anchors), dim=0)
+        residuals = torch.cat(
+            (landmark_residuals, torch.zeros_like(frame_anchors)), dim=0
+        )
+    else:
+        controls = target_points
+        residuals = landmark_residuals
+    radial_weights, affine_weights = _humanoid_tps_solve(
+        controls, residuals, settings.tps_regularization
+    )
+    base_map, residual_map = _humanoid_mapping_grid(
+        target_height,
+        target_width,
+        source_height,
+        source_width,
+        base_coefficients,
+        controls,
+        radial_weights,
+        affine_weights,
+        settings.max_local_shift_pixels,
+    )
+    applied_local_scale = 1.0
+    source_coordinates = base_map + residual_map
+    folded_fraction, determinant = _humanoid_fold_fraction(
+        source_coordinates, target_mask_nchw, source_width, source_height
+    )
+    allowed_fold = float(settings.max_folded_area_percent) / 100.0
+    if settings.fold_protection:
+        while folded_fraction > allowed_fold and applied_local_scale > 0.05:
+            applied_local_scale *= 0.82
+            source_coordinates = base_map + residual_map * applied_local_scale
+            folded_fraction, determinant = _humanoid_fold_fraction(
+                source_coordinates, target_mask_nchw, source_width, source_height
+            )
+
+    grid = torch.empty((1, target_height, target_width, 2), dtype=torch.float32)
+    grid[0, ..., 0] = (
+        (source_coordinates[..., 0] * max(1, source_width - 1) + 0.5)
+        / float(source_width)
+        * 2.0
+        - 1.0
+    )
+    grid[0, ..., 1] = (
+        (source_coordinates[..., 1] * max(1, source_height - 1) + 0.5)
+        / float(source_height)
+        * 2.0
+        - 1.0
+    )
+    device = source_rgb.device
+    grid_device = grid.to(device)
+    aligned_rgb = _geometry_warp(source_rgb, grid_device).clamp(0.0, 1.0)
+    aligned_source_mask = _geometry_warp(source_mask_nchw.to(device), grid_device).clamp(0.0, 1.0)
+    target_mask_device = target_mask_nchw.to(device)
+    if settings.output_mask_mode == "target":
+        output_mask = target_mask_device
+    elif settings.output_mask_mode == "intersection":
+        output_mask = target_mask_device * aligned_source_mask
+    elif settings.output_mask_mode == "warped_source":
+        output_mask = aligned_source_mask
+    else:
+        raise ValueError(f"Unknown humanoid output mask mode: {settings.output_mask_mode!r}")
+    output_mask = output_mask.clamp(0.0, 1.0)
+    aligned_rgb = aligned_rgb * output_mask
+    aligned_rgba = torch.cat((aligned_rgb, output_mask), dim=1)
+
+    displacement_pixels = residual_map.clone()
+    displacement_pixels[..., 0] *= max(1, source_width - 1) * applied_local_scale
+    displacement_pixels[..., 1] *= max(1, source_height - 1) * applied_local_scale
+    preview_limit = max(1.0, float(settings.max_local_shift_pixels))
+    determinant_preview = torch.zeros((target_height, target_width))
+    determinant_preview[:-1, :-1] = determinant
+    positive_scale = torch.quantile(determinant_preview[determinant_preview > 0], 0.9) if bool((determinant_preview > 0).any()) else torch.tensor(1.0)
+    deformation_preview = torch.stack(
+        (
+            (0.5 + displacement_pixels[..., 0] / (2.0 * preview_limit)).clamp(0.0, 1.0),
+            (0.5 + displacement_pixels[..., 1] / (2.0 * preview_limit)).clamp(0.0, 1.0),
+            (determinant_preview / positive_scale.clamp_min(1e-6)).clamp(0.0, 1.0),
+        ),
+        dim=-1,
+    ).unsqueeze(0) * target_mask_nchw.movedim(1, -1)
+    landmark_overlay = _humanoid_landmark_overlay(
+        target_reference, target_points, source_points, base_coefficients
+    )
+
+    final_landmark_residuals = _humanoid_tps_evaluate(
+        target_points, controls, radial_weights, affine_weights
+    )
+    if float(settings.max_local_shift_pixels) > 0.0:
+        landmark_residual_pixels = final_landmark_residuals * source_points.new_tensor(
+            (max(1, source_width - 1), max(1, source_height - 1))
+        )
+        landmark_magnitude = torch.linalg.vector_norm(
+            landmark_residual_pixels, dim=1, keepdim=True
+        )
+        final_landmark_residuals *= (
+            float(settings.max_local_shift_pixels) / landmark_magnitude.clamp_min(1e-8)
+        ).clamp(max=1.0)
+    mapped_landmarks = base_at_landmarks + final_landmark_residuals * applied_local_scale
+    errors = (mapped_landmarks - source_points) * source_points.new_tensor(
+        (max(1, source_width - 1), max(1, source_height - 1))
+    )
+    rms_error = float(torch.sqrt(errors.square().sum(dim=1).mean()))
+    warnings = []
+    if counts["arms"] < 4:
+        warnings.append("WARNING: fewer than four arm joints matched; arms cannot be aligned reliably")
+    if settings.hand_strength > 0.0 and counts["hands"] == 0:
+        warnings.append("hands were not detected in both views; body wrists remain active")
+    if not anatomy_valid:
+        warnings.append(
+            "SAFE FALLBACK: target anatomy is incomplete; local TPS was disabled and only silhouette framing was applied"
+        )
+    report_lines = [
+        "Pixal3D humanoid pose view alignment",
+        f"view={settings.view}, output={target_width}x{target_height}, global_model={settings.global_model}, global_strength={settings.global_alignment_strength:.3f}",
+        f"people: source={source_person}, target={target_person}; common_landmarks={len(names)}, score_threshold={settings.score_threshold:.3f}",
+        "landmarks: " + ", ".join(f"{key}={value}" for key, value in counts.items()),
+        f"anatomy_valid={anatomy_valid}; global framing source=silhouette masks",
+        f"strengths: torso={settings.torso_strength:.2f}, arms={settings.arm_strength:.2f}, legs={settings.leg_strength:.2f}, head={settings.head_strength:.2f}, hands={settings.hand_strength:.2f}, feet={settings.foot_strength:.2f}",
+        f"TPS: regularization={settings.tps_regularization:.6f}, max_shift={settings.max_local_shift_pixels:.1f}px, outer_stability={settings.outer_stability:.2f}, applied_local_scale={applied_local_scale:.4f}",
+        f"landmark_rms={rms_error:.3f}px, folded_area={folded_fraction:.4%}, output_mask={settings.output_mask_mode}",
+        "overlay: magenta=source landmark after global fit, green=target landmark, yellow=required local correction",
+    ]
+    report_lines.extend(warnings)
+    return (
+        aligned_rgb.movedim(1, -1).cpu(),
+        aligned_rgba.movedim(1, -1).cpu(),
+        output_mask[:, 0].cpu(),
+        deformation_preview.cpu(),
+        landmark_overlay.cpu(),
+        "\n".join(report_lines),
+    )
+
+
+def make_humanoid_pose_reference(
+    depth_map: torch.Tensor,
+    mesh_mask: torch.Tensor,
+    relief_strength: float,
+    edge_strength: float,
+    background_level: float,
+):
+    """Turn a geometric depth map into a neutral character render for pose detection."""
+    depth = _geometry_gray_nchw(_geometry_single_nchw(depth_map, "depth_map"))
+    height, width = int(depth.shape[-2]), int(depth.shape[-1])
+    mask = _geometry_optional_mask_nchw(mesh_mask, "mesh_mask", height, width)
+    if mask is None:
+        raise ValueError("mesh_mask is required")
+    sobel_x = depth.new_tensor(
+        [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]]
+    ).unsqueeze(0) / 8.0
+    sobel_y = depth.new_tensor(
+        [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]]
+    ).unsqueeze(0) / 8.0
+    gradient_x = torch.nn.functional.conv2d(depth, sobel_x, padding=1)
+    gradient_y = torch.nn.functional.conv2d(depth, sobel_y, padding=1)
+    relief = max(0.0, float(relief_strength))
+    normal = torch.cat(
+        (-gradient_x * relief, -gradient_y * relief, torch.ones_like(depth)), dim=1
+    )
+    normal = torch.nn.functional.normalize(normal, dim=1)
+    lights = normal.new_tensor(
+        [[-0.45, -0.35, 0.82], [0.45, -0.25, 0.86], [0.0, 0.35, 0.94]]
+    )
+    lights = torch.nn.functional.normalize(lights, dim=1)
+    light_values = torch.einsum("bchw,kc->bkhw", normal, lights).clamp_min(0.0)
+    shading = 0.18 + 0.82 * light_values.mean(dim=1, keepdim=True)
+    shading *= 0.72 + 0.28 * depth.clamp(0.0, 1.0)
+    silhouette_edge = _geometry_edge_magnitude(mask)
+    shading = (shading - silhouette_edge * max(0.0, float(edge_strength))).clamp(0.0, 1.0)
+    background = min(1.0, max(0.0, float(background_level)))
+    output = shading * mask + background * (1.0 - mask)
+    return output.repeat(1, 3, 1, 1).movedim(1, -1).cpu()
+_SAM3D_OPENPOSE18_TO_MHR70 = (
+    0, 69, 6, 8, 41, 5, 7, 62, 10, 12, 14, 9, 11, 13, 2, 1, 4, 3,
+)
+_SAM3D_HAND21_TO_MHR70_RIGHT = (
+    41, 24, 23, 22, 21, 28, 27, 26, 25, 32, 31, 30, 29, 36, 35, 34, 33,
+    40, 39, 38, 37,
+)
+_SAM3D_HAND21_TO_MHR70_LEFT = (
+    62, 45, 44, 43, 42, 49, 48, 47, 46, 53, 52, 51, 50, 57, 56, 55, 54,
+    61, 60, 59, 58,
+)
+_OPENPOSE_BODY_EDGES = (
+    (1, 2), (1, 5), (2, 3), (3, 4), (5, 6), (6, 7),
+    (1, 8), (8, 9), (9, 10), (1, 11), (11, 12), (12, 13),
+    (1, 0), (0, 14), (14, 16), (0, 15), (15, 17),
+)
+
+
+def _sam3d_select_person(pose_data, requested_index: int):
+    if not isinstance(pose_data, dict) or not pose_data.get("frames"):
+        raise ValueError("mhr_pose_data contains no frames")
+    people = pose_data["frames"][0]
+    if not people:
+        raise ValueError("mhr_pose_data contains no detected people")
+    index = int(requested_index)
+    if index >= 0:
+        if index >= len(people):
+            raise ValueError(
+                f"person_index={index} is outside the {len(people)} SAM3D people"
+            )
+        return people[index], index
+    best_index = 0
+    best_area = -1.0
+    for candidate_index, person in enumerate(people):
+        points = person.get("pred_keypoints_2d")
+        if points is None:
+            continue
+        value = torch.as_tensor(points, dtype=torch.float32)
+        finite = torch.isfinite(value).all(dim=1)
+        value = value[finite]
+        if value.shape[0] < 2:
+            area = 0.0
+        else:
+            span = value.amax(dim=0) - value.amin(dim=0)
+            area = float(span[0] * span[1])
+        if area > best_area:
+            best_area = area
+            best_index = candidate_index
+    return people[best_index], best_index
+
+
+def _sam3d_project_points(
+    points: torch.Tensor,
+    source_view: str,
+    target_view: str,
+    target_center_x: float,
+    target_center_y: float,
+    scale: float,
+    horizontal_scale: float,
+    body_center_xz: torch.Tensor,
+    body_center_y: float,
+    mirror_side_projection: bool,
+):
+    centered = points.float().clone()
+    centered[:, 0] -= body_center_xz[0]
+    centered[:, 2] -= body_center_xz[1]
+    centered[:, 1] -= float(body_center_y)
+    delta = math.radians(
+        VIEW_AZIMUTHS[VIEW_NAMES.index(target_view)]
+        - VIEW_AZIMUTHS[VIEW_NAMES.index(source_view)]
+    )
+    cosine, sine = math.cos(delta), math.sin(delta)
+    horizontal = cosine * centered[:, 0] + sine * centered[:, 2]
+    if bool(mirror_side_projection) and target_view in ("left", "right"):
+        horizontal = -horizontal
+    x = float(target_center_x) + horizontal * float(scale) * float(horizontal_scale)
+    y = float(target_center_y) + centered[:, 1] * float(scale)
+    return torch.stack((x, y), dim=1)
+
+
+def _sam3d_pose_preview(mask: torch.Tensor, body: torch.Tensor, scores: torch.Tensor):
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    value = mask[0].detach().float().cpu().clamp(0.0, 1.0)
+    background = (value.unsqueeze(-1).repeat(1, 1, 3) * 80.0).byte().numpy()
+    canvas = Image.fromarray(background, mode="RGB")
+    draw = ImageDraw.Draw(canvas)
+    height, width = value.shape
+    line_width = max(2, int(round(max(height, width) / 384.0)))
+    radius = max(3, int(round(max(height, width) / 256.0)))
+    for first, second in _OPENPOSE_BODY_EDGES:
+        if float(scores[first]) <= 0.0 or float(scores[second]) <= 0.0:
+            continue
+        draw.line(
+            (
+                float(body[first, 0]), float(body[first, 1]),
+                float(body[second, 0]), float(body[second, 1]),
+            ),
+            fill=(0, 220, 255),
+            width=line_width,
+        )
+    for point, score in zip(body, scores):
+        if float(score) <= 0.0:
+            continue
+        x, y = float(point[0]), float(point[1])
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=(255, 210, 0))
+    return torch.from_numpy(np.asarray(canvas, dtype=np.float32).copy()).div_(255.0).unsqueeze(0)
+
+
+def project_sam3d_humanoid_pose(
+    mhr_pose_data,
+    target_mask: torch.Tensor,
+    source_view: str,
+    target_view: str,
+    skeleton_height_percent: float,
+    horizontal_scale_percent: float,
+    horizontal_offset_pixels: float,
+    vertical_offset_pixels: float,
+    mirror_side_projection: bool,
+    include_hands: bool,
+    person_index: int,
+):
+    """Project a reliable source SAM3D skeleton into any Pixal3D camera view."""
+    if source_view not in VIEW_NAMES or target_view not in VIEW_NAMES:
+        raise ValueError(f"source_view and target_view must be one of {VIEW_NAMES}")
+    if not isinstance(target_mask, torch.Tensor) or target_mask.ndim != 3 or target_mask.shape[0] != 1:
+        raise ValueError("target_mask must be a single-item MASK [1,H,W]")
+    mask = target_mask.detach().float().cpu().clamp(0.0, 1.0)
+    target_height, target_width = int(mask.shape[1]), int(mask.shape[2])
+    mask_nchw = mask.unsqueeze(1)
+    x0, y0, x1, y1 = _geometry_mask_bbox(mask_nchw)
+    person, selected_person = _sam3d_select_person(mhr_pose_data, int(person_index))
+    raw = person.get("pred_keypoints_3d")
+    if raw is None:
+        raise ValueError("Selected SAM3D person has no pred_keypoints_3d")
+    keypoints = torch.as_tensor(raw, dtype=torch.float32).cpu()
+    if keypoints.ndim != 2 or keypoints.shape[0] < 70 or keypoints.shape[1] < 3:
+        raise ValueError(
+            f"SAM3D pred_keypoints_3d must contain at least [70,3], got {tuple(keypoints.shape)}"
+        )
+    body_3d = keypoints[torch.tensor(_SAM3D_OPENPOSE18_TO_MHR70)]
+    finite_body = torch.isfinite(body_3d).all(dim=1)
+    if int(finite_body.sum()) < 14:
+        raise ValueError("SAM3D body contains too few finite joints")
+    hip_center = 0.5 * (body_3d[8] + body_3d[11])
+    raw_y = body_3d[finite_body, 1]
+    body_height = float(raw_y.amax() - raw_y.amin())
+    if not math.isfinite(body_height) or body_height <= 1e-6:
+        raise ValueError("SAM3D body has invalid vertical extent")
+    target_bbox_height = max(1.0, y1 - y0 + 1.0)
+    desired_height = target_bbox_height * min(1.2, max(0.5, float(skeleton_height_percent) / 100.0))
+    scale = desired_height / body_height
+    target_center_x = 0.5 * (x0 + x1) + float(horizontal_offset_pixels)
+    target_center_y = 0.5 * (y0 + y1) + float(vertical_offset_pixels)
+    horizontal_scale = min(2.0, max(0.25, float(horizontal_scale_percent) / 100.0))
+    center_xz = torch.stack((hip_center[0], hip_center[2]))
+    body_center_y = 0.5 * float(raw_y.amin() + raw_y.amax())
+    body_2d = _sam3d_project_points(
+        body_3d,
+        source_view,
+        target_view,
+        target_center_x,
+        target_center_y,
+        scale,
+        horizontal_scale,
+        center_xz,
+        body_center_y,
+        bool(mirror_side_projection),
+    )
+    body_scores = finite_body.float()
+    margin_x, margin_y = target_width * 0.25, target_height * 0.25
+    in_canvas = (
+        (body_2d[:, 0] >= -margin_x)
+        & (body_2d[:, 0] <= target_width - 1 + margin_x)
+        & (body_2d[:, 1] >= -margin_y)
+        & (body_2d[:, 1] <= target_height - 1 + margin_y)
+    )
+    body_scores *= in_canvas.float()
+
+    def project_hand(mapping):
+        points_3d = keypoints[torch.tensor(mapping)]
+        points_2d = _sam3d_project_points(
+            points_3d,
+            source_view,
+            target_view,
+            target_center_x,
+            target_center_y,
+            scale,
+            horizontal_scale,
+            center_xz,
+            body_center_y,
+            bool(mirror_side_projection),
+        )
+        scores = torch.isfinite(points_3d).all(dim=1).float()
+        return points_2d, scores
+
+    if bool(include_hands):
+        right_hand, right_scores = project_hand(_SAM3D_HAND21_TO_MHR70_RIGHT)
+        left_hand, left_scores = project_hand(_SAM3D_HAND21_TO_MHR70_LEFT)
+    else:
+        right_hand = left_hand = torch.zeros((21, 2), dtype=torch.float32)
+        right_scores = left_scores = torch.zeros(21, dtype=torch.float32)
+
+    def flatten(points, scores):
+        return torch.cat((points, scores.unsqueeze(1)), dim=1).reshape(-1).tolist()
+
+    person_output = {
+        "pose_keypoints_2d": flatten(body_2d, body_scores),
+        "foot_keypoints_2d": [0.0] * 18,
+        "face_keypoints_2d": [0.0] * 210,
+        "hand_right_keypoints_2d": flatten(right_hand, right_scores),
+        "hand_left_keypoints_2d": flatten(left_hand, left_scores),
+    }
+    pose = [{
+        "canvas_width": target_width,
+        "canvas_height": target_height,
+        "people": [person_output],
+    }]
+    preview = _sam3d_pose_preview(mask, body_2d, body_scores)
+    report = "\n".join(
+        (
+            "Pixal3D SAM3D humanoid pose projection",
+            f"source_view={source_view}, target_view={target_view}, output={target_width}x{target_height}, person={selected_person}",
+            f"body_joints={int(body_scores.sum())}/18, include_hands={bool(include_hands)}",
+            f"skeleton_height={float(skeleton_height_percent):.2f}%, horizontal_scale={float(horizontal_scale_percent):.2f}%",
+            f"offset={float(horizontal_offset_pixels):.1f}/{float(vertical_offset_pixels):.1f}px, mirror_side={bool(mirror_side_projection)}",
+            "preview: cyan=projected bones, yellow=projected joints, gray=target mesh mask",
+        )
+    )
+    return pose, preview, report
 
 
 def _rasterize_projected_triangles(
@@ -1955,8 +3485,38 @@ def auto_align_single_view(
 
     resolution = int(shape_latent.get("coord_resolution", int(coords[:, 1:].amax()) + 1))
     world = _world_from_grid_coords(coords[:, 1:].float(), resolution).cpu()
-    source = apply_comfy_transparency(image, mask, view, mask_mode)[:1][0]
-    source = source.detach().float().cpu()
+    preserve_source_alpha = image.shape[-1] >= 4 or (
+        mask is not None and mask_mode != "ignore"
+    )
+    source_rgb = image[:1, ..., :3].detach().float().clamp(0.0, 1.0)
+    source_alpha = (
+        image[:1, ..., 3:4].detach().float().clamp(0.0, 1.0)
+        if image.shape[-1] >= 4
+        else torch.ones_like(source_rgb[..., :1])
+    )
+    if mask is not None and mask_mode != "ignore":
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+        if mask.ndim != 3 or mask.shape[0] not in (1, source_rgb.shape[0]):
+            raise ValueError(f"{view}_mask must be [1,H,W] or match the image batch")
+        if tuple(mask.shape[1:]) != tuple(source_rgb.shape[1:3]):
+            mask = torch.nn.functional.interpolate(
+                mask[:1].unsqueeze(1).float(),
+                size=source_rgb.shape[1:3],
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)
+        else:
+            mask = mask[:1].float()
+        mask_alpha = mask.clamp(0.0, 1.0)
+        if mask_mode == "transparency":
+            mask_alpha = 1.0 - mask_alpha
+        source_alpha *= mask_alpha.unsqueeze(-1)
+    source = (
+        torch.cat((source_rgb, source_alpha), dim=-1)
+        if preserve_source_alpha
+        else source_rgb
+    )[0].cpu()
     azimuth = VIEW_AZIMUTHS[VIEW_NAMES.index(view)]
     scale_multiplier = float(silhouette_scale_percent) / 100.0
     requested_strength = min(1.0, max(0.0, float(alignment_strength)))
@@ -1993,8 +3553,6 @@ def auto_align_single_view(
         for base, automatic in zip(base_source_center, source_box_center)
     )
     target_center = (
-
-
         (1.0 - strength) * base_target_center[0]
         + strength * projected_center[0]
         + int(horizontal_offset_pixels),
@@ -2039,7 +3597,7 @@ def auto_align_single_view(
     )[0, 0]
     overlay_alpha = point_mask.unsqueeze(-1) * 0.65
     overlay_color = torch.tensor([0.0, 1.0, 0.25]).view(1, 1, 3)
-    overlay = warped[0] * (1.0 - overlay_alpha) + overlay_color * overlay_alpha
+    overlay = warped[0, ..., :3] * (1.0 - overlay_alpha) + overlay_color * overlay_alpha
     report = "\n".join(
         [
             f"Pixal3D automatic alignment: {view}",
@@ -2103,10 +3661,11 @@ def batch_four_views(
     right: torch.Tensor,
     back: torch.Tensor,
 ) -> torch.Tensor:
-    """Make an explicitly ordered F/L/R/B IMAGE batch without resizing."""
+    """Make an explicitly ordered F/L/R/B RGB(A) batch without resizing."""
     images = (front, left, right, back)
     first_shape = None
-    prepared = []
+    validated = []
+    preserve_alpha = False
     for name, image in zip(VIEW_NAMES, images):
         if not isinstance(image, torch.Tensor) or image.ndim != 4 or image.shape[-1] < 3:
             raise ValueError(f"{name} must be a ComfyUI IMAGE [B,H,W,3/4]")
@@ -2117,7 +3676,16 @@ def batch_four_views(
             raise ValueError(
                 f"All four aligned views must have the same size; front={first_shape}, {name}={shape}"
             )
-        prepared.append(image[:1, ..., :3].float().clamp(0.0, 1.0))
+        preserve_alpha |= image.shape[-1] >= 4
+        validated.append(image[:1].float().clamp(0.0, 1.0))
+    prepared = []
+    for image in validated:
+        rgb = image[..., :3]
+        if preserve_alpha:
+            alpha = image[..., 3:4] if image.shape[-1] >= 4 else torch.ones_like(rgb[..., :1])
+            prepared.append(torch.cat((rgb, alpha), dim=-1))
+        else:
+            prepared.append(rgb)
     return torch.cat(prepared, dim=0)
 
 
@@ -2622,6 +4190,77 @@ def _inner_edge_feather_mask(mask: torch.Tensor, width_pixels: float) -> torch.T
     return (source * blurred).clamp(0.0, 1.0)
 
 
+def _erode_mask_nchw(mask: torch.Tensor, radius_pixels: float) -> torch.Tensor:
+    """Erode an NCHW mask by a square pixel radius using separable max-pooling."""
+    radius = max(0, int(round(float(radius_pixels))))
+    source = mask.float().clamp(0.0, 1.0)
+    if radius == 0:
+        return source
+    kernel = radius * 2 + 1
+    outside = 1.0 - source
+    outside = torch.nn.functional.max_pool2d(
+        torch.nn.functional.pad(
+            outside, (radius, radius, 0, 0), mode="constant", value=1.0
+        ),
+        kernel_size=(1, kernel),
+        stride=1,
+    )
+    outside = torch.nn.functional.max_pool2d(
+        torch.nn.functional.pad(
+            outside, (0, 0, radius, radius), mode="constant", value=1.0
+        ),
+        kernel_size=(kernel, 1),
+        stride=1,
+    )
+    return (1.0 - outside).clamp(0.0, 1.0)
+
+
+def _camera_visibility_feather_weights(
+    visible: torch.Tensor,
+    flat_pixels: torch.Tensor,
+    uv_ndc: torch.Tensor,
+    height: int,
+    width: int,
+    feather_pixels: float,
+    inset_pixels: float = 0.0,
+) -> torch.Tensor:
+    """Sample an inward feather from the actual z-buffer-visible silhouette.
+
+    The mask is built from the same rounded camera pixels used by the z-buffer.
+    ``inset_pixels`` removes a fully transparent inner rim before
+    ``feather_pixels`` transitions toward full opacity. A one-pixel dilation
+    stabilizes sparse boundaries without making hidden voxels eligible: the
+    returned values are still multiplied by ``visible`` later.
+    """
+    feather = max(0.0, float(feather_pixels))
+    inset = max(0.0, float(inset_pixels))
+    if feather <= 1e-6 and inset <= 1e-6:
+        return torch.ones_like(visible, dtype=torch.float32)
+    mask_flat = torch.zeros(
+        (int(height) * int(width),), device=visible.device, dtype=torch.float32
+    )
+    if torch.any(visible):
+        mask_flat.scatter_(0, flat_pixels[visible], 1.0)
+    mask = mask_flat.reshape(1, 1, int(height), int(width))
+    mask = torch.nn.functional.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
+    # Compensate the one-pixel stabilization dilation so the user-facing inset
+    # remains measured from the original visible silhouette.
+    mask = _erode_mask_nchw(mask, inset + 1.0 if inset > 1e-6 else 0.0)
+    if feather > 1e-6:
+        mask = _inner_edge_feather_mask(mask, feather)
+        # A raw Gaussian step is still about 0.5 at the boundary. Remap that
+        # half-range to 0..1 so overlapping cameras can make a complete transition
+        # instead of retaining an opaque rim at their visible silhouettes.
+        mask = ((mask - 0.5) * 2.0).clamp(0.0, 1.0)
+    return torch.nn.functional.grid_sample(
+        mask,
+        uv_ndc.view(1, -1, 1, 2),
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=False,
+    ).flatten().clamp(0.0, 1.0)
+
+
 def _view_crop_mask(
     height: int,
     width: int,
@@ -2999,8 +4638,18 @@ def reproject_voxel_rgb(
     view_crop_right_percent: tuple[float, float, float, float] = (0.0,) * 4,
     view_crop_top_percent: tuple[float, float, float, float] = (0.0,) * 4,
     view_crop_bottom_percent: tuple[float, float, float, float] = (0.0,) * 4,
+    view_coverage_modes: tuple[str, str, str, str] = ("angular_sector",) * 4,
+    view_camera_feather_pixels: tuple[float, float, float, float] = (0.0,) * 4,
+    view_camera_feather_inset_pixels: tuple[float, float, float, float] = (0.0,) * 4,
+    camera_composite_mode: str = "ordered_layers",
 ):
-    """Blend ordered high-resolution F/L/R/B RGB layers into a PBR voxel field."""
+    """Blend high-resolution F/L/R/B RGB views into a PBR voxel field.
+
+    ``ordered_layers`` preserves the original Photoshop-style compositing.
+    ``weighted_average`` normalizes all camera contributions per voxel, making
+    overlaps independent of layer order and preventing the top view from
+    darkening or dominating a seam.
+    """
     coords = voxel.data
     colors = voxel.voxel_colors
     resolution = int(voxel.resolution)
@@ -3029,11 +4678,14 @@ def reproject_voxel_rgb(
         == len(view_blur_sigmas)
         == len(view_flip_horizontal)
         == len(view_edge_feather_pixels)
+        == len(view_coverage_modes)
+        == len(view_camera_feather_pixels)
+        == len(view_camera_feather_inset_pixels)
         == 4
     ):
         raise ValueError(
             "Blend modes, blur settings, horizontal flips and edge feather settings "
-            "must contain F/L/R/B values"
+            "coverage modes, camera feather and inset settings must contain F/L/R/B values"
         )
     invalid_modes = [mode for mode in view_blend_modes if mode not in BLEND_MODES]
     if invalid_modes:
@@ -3041,6 +4693,16 @@ def reproject_voxel_rgb(
     invalid_targets = [target for target in view_blur_targets if target not in GAUSSIAN_BLUR_TARGETS]
     if invalid_targets:
         raise ValueError(f"Unknown Gaussian blur target: {invalid_targets[0]!r}")
+    invalid_coverage_modes = [
+        mode for mode in view_coverage_modes if mode not in COVERAGE_MODES
+    ]
+    if invalid_coverage_modes:
+        raise ValueError(f"Unknown coverage mode: {invalid_coverage_modes[0]!r}")
+    if camera_composite_mode not in CAMERA_COMPOSITE_MODES:
+        raise ValueError(
+            f"camera_composite_mode must be one of {CAMERA_COMPOSITE_MODES}, "
+            f"got {camera_composite_mode!r}"
+        )
     view_softnesses = _four_view_values(edge_softness_percent, "edge_softness_percent")
     view_background_thresholds = _four_view_values(
         background_threshold, "background_threshold"
@@ -3072,6 +4734,8 @@ def reproject_voxel_rgb(
     projected_rgb = underlay_rgb.clone()
     weight_sum = torch.zeros((colors.shape[0],), device=device, dtype=torch.float32)
     debug_rgb = torch.zeros_like(base_rgb)
+    weighted_rgb_sum = torch.zeros_like(base_rgb)
+    weighted_debug_sum = torch.zeros_like(base_rgb)
     tolerance = max(0.0, float(visibility_tolerance_voxels)) / float(max(1, resolution - 1))
     palette = (
         (1.0, 0.15, 0.0),
@@ -3082,6 +4746,7 @@ def reproject_voxel_rgb(
     report_lines = [
         "Pixal3D image-guided voxel reprojection",
         f"voxels={colors.shape[0]:,}, views={width}x{height}, fov={float(fov):.2f}, strength={float(reprojection_strength):.2f}",
+        f"camera_composite_mode={camera_composite_mode}",
         f"generated_texture={generated_strength:.2%}, uncovered_color={uncovered_color}",
         f"layer_order_bottom_to_top={' > '.join(layer_order)}",
         f"visibility_tolerance={float(visibility_tolerance_voxels):.2f} voxels; softness/background threshold are per-view",
@@ -3095,14 +4760,17 @@ def reproject_voxel_rgb(
         blend_mode = view_blend_modes[index]
         blur_target = view_blur_targets[index]
         blur_sigma = view_blur_sigmas[index]
-
-
         flip_horizontal = view_flip_horizontal[index]
         edge_feather_pixels = view_edge_feather_pixels[index]
         crop_left = view_crop_lefts[index]
         crop_right = view_crop_rights[index]
         crop_top = view_crop_tops[index]
         crop_bottom = view_crop_bottoms[index]
+        coverage_mode = view_coverage_modes[index]
+        camera_feather_pixels = max(0.0, float(view_camera_feather_pixels[index]))
+        camera_feather_inset_pixels = max(
+            0.0, float(view_camera_feather_inset_pixels[index])
+        )
         softness = view_softnesses[index]
         view_background_threshold = view_background_thresholds[index]
         configured_weight = max(0.0, float(configured_weight))
@@ -3225,30 +4893,55 @@ def reproject_voxel_rgb(
             foreground &= sampled_edge > 1e-6
             foreground_strength *= sampled_edge
 
-        angular = _angular_coverage_weight(
-            world, camera_direction, float(coverage), float(softness)
-        )
+        if coverage_mode == "all_camera_visible":
+            # Camera visibility already excludes out-of-frame and occluded voxels.
+            # Avoid rejecting silhouette parts merely because their positions lie
+            # outside an origin-centred angular sector.
+            angular = _camera_visibility_feather_weights(
+                visible,
+                flat,
+                uv_ndc,
+                height,
+                width,
+                camera_feather_pixels,
+                camera_feather_inset_pixels,
+            )
+        else:
+            angular = _angular_coverage_weight(
+                world, camera_direction, float(coverage), float(softness)
+            )
         eligible = visible & foreground & (angular > 0.0)
         coverage_weight = angular * visible.float() * foreground_strength
         blend_weight = coverage_weight * configured_weight
-        # True bottom-to-top layer compositing. Weight is an opacity multiplier:
-        # 1.0 is fully opaque in the camera centre, values below 1 mix with lower
-        # layers, and values above 1 push soft/feathered coverage toward opacity.
-        blended_view = blend_rgb(projected_rgb, sampled, blend_mode)
         layer_alpha = blend_weight.clamp(0.0, 1.0)
-        projected_rgb = torch.lerp(
-            projected_rgb, blended_view, layer_alpha.unsqueeze(1)
-        ).clamp(0.0, 1.0)
+        if camera_composite_mode == "weighted_average":
+            # Evaluate non-Normal modes against the common underlay, then
+            # normalize camera evidence.  For the normal mode this is exactly a
+            # weighted average of the unmodified source views.
+            blended_view = blend_rgb(underlay_rgb, sampled, blend_mode)
+            weighted_rgb_sum.add_(blended_view * blend_weight.unsqueeze(1))
+            debug_color = world.new_tensor(palette[index]).view(1, 3)
+            weighted_debug_sum.add_(debug_color * blend_weight.unsqueeze(1))
+        else:
+            # True bottom-to-top layer compositing. Weight is an opacity multiplier:
+            # 1.0 is fully opaque in the camera centre, values below 1 mix with lower
+            # layers, and values above 1 push soft/feathered coverage toward opacity.
+            blended_view = blend_rgb(projected_rgb, sampled, blend_mode)
+            projected_rgb = torch.lerp(
+                projected_rgb, blended_view, layer_alpha.unsqueeze(1)
+            ).clamp(0.0, 1.0)
+            debug_color = world.new_tensor(palette[index]).view(1, 3)
+            debug_rgb = torch.lerp(
+                debug_rgb,
+                debug_color.expand_as(debug_rgb),
+                layer_alpha.unsqueeze(1),
+            )
         weight_sum.add_(blend_weight)
-        debug_color = world.new_tensor(palette[index]).view(1, 3)
-        debug_rgb = torch.lerp(
-            debug_rgb,
-            debug_color.expand_as(debug_rgb),
-            layer_alpha.unsqueeze(1),
-        )
         report_lines.append(
             f"layer {layer_position}/4 {name}: mode={blend_mode}, weight={configured_weight:.2f}, "
-            f"coverage={float(coverage):.1f}°, softness={float(softness):.1f}%, "
+            f"coverage_mode={coverage_mode}, coverage={float(coverage):.1f}°, "
+            f"softness={float(softness):.1f}%, camera_inset={camera_feather_inset_pixels:.1f}px, "
+            f"camera_feather={camera_feather_pixels:.1f}px, "
             f"background={float(view_background_threshold):.4f}, blur={blur_sigma:.2f}px/{blur_target}, "
             f"edge_feather={edge_feather_pixels:.1f}px, flip_x={bool(flip_horizontal)}, "
             f"crop=L{float(crop_left):.1f}%/R{float(crop_right):.1f}%/T{float(crop_top):.1f}%/B{float(crop_bottom):.1f}% "
@@ -3257,7 +4950,20 @@ def reproject_voxel_rgb(
         )
 
     has_source = weight_sum > 1e-8
-    blend_alpha = has_source.float() * min(1.0, max(0.0, float(reprojection_strength)))
+    if camera_composite_mode == "weighted_average":
+        denominator = weight_sum.clamp_min(1e-8).unsqueeze(1)
+        normalized_rgb = (weighted_rgb_sum / denominator).clamp(0.0, 1.0)
+        projected_rgb = torch.where(has_source.unsqueeze(1), normalized_rgb, underlay_rgb)
+        coverage_alpha = weight_sum.clamp(0.0, 1.0)
+        normalized_debug = (weighted_debug_sum / denominator).clamp(0.0, 1.0)
+        debug_rgb = normalized_debug * coverage_alpha.unsqueeze(1)
+        blend_alpha = coverage_alpha * min(
+            1.0, max(0.0, float(reprojection_strength))
+        )
+    else:
+        blend_alpha = has_source.float() * min(
+            1.0, max(0.0, float(reprojection_strength))
+        )
     final_rgb = torch.lerp(
         underlay_rgb, projected_rgb, blend_alpha.unsqueeze(1)
     ).clamp(0.0, 1.0)
@@ -3816,6 +5522,402 @@ class Pixal3DAutoAlignView:
         return result
 
 
+class Pixal3DGeometryAlignSettings:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "view": (VIEW_NAMES, {"default": "front"}),
+                "global_fit_mode": (GEOMETRY_ALIGN_FIT_MODES, {"default": "contain"}),
+                "global_alignment_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "local_alignment_strength": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "max_local_shift_pixels": ("FLOAT", {"default": 64.0, "min": 0.0, "max": 512.0, "step": 1.0}),
+                "boundary_lock_pixels": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 256.0, "step": 1.0}),
+                "analysis_size": ("INT", {"default": 512, "min": 256, "max": 1024, "step": 64}),
+                "control_grid_size": ("INT", {"default": 32, "min": 8, "max": 96, "step": 4}),
+                "optimization_steps": ("INT", {"default": 80, "min": 0, "max": 300, "step": 10}),
+                "depth_weight": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 10.0, "step": 0.05}),
+                "edge_weight": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 10.0, "step": 0.05}),
+                "silhouette_weight": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 10.0, "step": 0.05}),
+                "rigidity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "confidence_threshold": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 0.95, "step": 0.01}),
+                "source_depth_near_is_white": ("BOOLEAN", {"default": True}),
+                "target_depth_near_is_white": ("BOOLEAN", {"default": True}),
+                "background_threshold": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 0.5, "step": 0.001}),
+                "output_mask_mode": (GEOMETRY_ALIGN_MASK_MODES, {"default": "target"}),
+                "confidence_gate_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "source_depth_blur_pixels": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 32.0, "step": 0.25}),
+                "fold_prevention_strength": ("FLOAT", {"default": 10.0, "min": 0.0, "max": 100.0, "step": 0.5}),
+            }
+        }
+
+    RETURN_TYPES = ("PIXAL3D_GEOMETRY_ALIGN_SETTINGS",)
+    RETURN_NAMES = ("settings",)
+    FUNCTION = "build"
+    CATEGORY = categoryFolder
+    DESCRIPTION = (
+        "Collects camera-fit, regularized depth-flow, boundary locking and confidence "
+        "controls for one Geometry-Aware View Align node."
+    )
+
+    def build(
+        self,
+        view,
+        global_fit_mode,
+        global_alignment_strength,
+        local_alignment_strength,
+        max_local_shift_pixels,
+        boundary_lock_pixels,
+        analysis_size,
+        control_grid_size,
+        optimization_steps,
+        depth_weight,
+        edge_weight,
+        silhouette_weight,
+        rigidity,
+        confidence_threshold,
+        source_depth_near_is_white,
+        target_depth_near_is_white,
+        background_threshold,
+        output_mask_mode,
+        confidence_gate_strength,
+        source_depth_blur_pixels,
+        fold_prevention_strength,
+    ):
+        settings = GeometryAlignSettings(
+            view=str(view),
+            global_fit_mode=str(global_fit_mode),
+            global_alignment_strength=min(1.0, max(0.0, float(global_alignment_strength))),
+            local_alignment_strength=min(1.0, max(0.0, float(local_alignment_strength))),
+            max_local_shift_pixels=max(0.0, float(max_local_shift_pixels)),
+            boundary_lock_pixels=max(0.0, float(boundary_lock_pixels)),
+            analysis_size=max(256, int(analysis_size)),
+            control_grid_size=max(8, int(control_grid_size)),
+            optimization_steps=max(0, int(optimization_steps)),
+            depth_weight=max(0.0, float(depth_weight)),
+            edge_weight=max(0.0, float(edge_weight)),
+            silhouette_weight=max(0.0, float(silhouette_weight)),
+            rigidity=max(0.0, float(rigidity)),
+            confidence_threshold=min(0.95, max(0.0, float(confidence_threshold))),
+            source_depth_near_is_white=bool(source_depth_near_is_white),
+            target_depth_near_is_white=bool(target_depth_near_is_white),
+            background_threshold=min(1.0, max(0.0, float(background_threshold))),
+            output_mask_mode=str(output_mask_mode),
+            confidence_gate_strength=min(1.0, max(0.0, float(confidence_gate_strength))),
+            source_depth_blur_pixels=max(0.0, float(source_depth_blur_pixels)),
+            fold_prevention_strength=max(0.0, float(fold_prevention_strength)),
+        )
+        if settings.view not in VIEW_NAMES:
+            raise ValueError(f"Unknown geometry align view: {settings.view!r}")
+        if settings.global_fit_mode not in GEOMETRY_ALIGN_FIT_MODES:
+            raise ValueError(f"Unknown geometry fit mode: {settings.global_fit_mode!r}")
+        if settings.output_mask_mode not in GEOMETRY_ALIGN_MASK_MODES:
+            raise ValueError(f"Unknown geometry output mask mode: {settings.output_mask_mode!r}")
+        return (settings,)
+
+
+class Pixal3DGeometryAwareViewAlign:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "source_depth": ("IMAGE",),
+                "target_depth": ("IMAGE",),
+                "settings": ("PIXAL3D_GEOMETRY_ALIGN_SETTINGS",),
+            },
+            "optional": {
+                "source_mask": ("MASK",),
+                "target_mask": ("MASK",),
+            },
+        }
+
+    RETURN_TYPES = (
+        "IMAGE",
+        "IMAGE",
+        "MASK",
+        "IMAGE",
+        "MASK",
+        "IMAGE",
+        "IMAGE",
+        "STRING",
+    )
+    RETURN_NAMES = (
+        "aligned_image",
+        "aligned_rgba",
+        "aligned_mask",
+        "warped_source_depth",
+        "confidence_mask",
+        "flow_preview",
+        "depth_overlay",
+        "report",
+    )
+    FUNCTION = "align"
+    CATEGORY = categoryFolder
+    DESCRIPTION = (
+        "Fits one source RGB/depth view to the model's rendered depth using global "
+        "silhouette placement plus a confidence-gated, contour-locked PyTorch flow "
+        "grid. Use one node per Front/Left/Right/Back view."
+    )
+
+    def align(
+        self,
+        image,
+        source_depth,
+        target_depth,
+        settings,
+        source_mask=None,
+        target_mask=None,
+    ):
+        result = geometry_aware_view_align(
+            image,
+            source_depth,
+            target_depth,
+            settings,
+            source_mask,
+            target_mask,
+        )
+        logging.info("%s", result[-1].replace("\n", " | "))
+        return result
+
+
+class Pixal3DHumanoidAlignSettings:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "view": (VIEW_NAMES, {"default": "front"}),
+                "global_model": (HUMANOID_GLOBAL_MODELS, {"default": "similarity"}),
+                "score_threshold": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "global_alignment_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "torso_strength": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "arm_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "leg_strength": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "head_strength": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "hand_strength": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "foot_strength": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "tps_regularization": ("FLOAT", {"default": 0.002, "min": 0.000001, "max": 0.1, "step": 0.0005}),
+                "max_local_shift_pixels": ("FLOAT", {"default": 192.0, "min": 0.0, "max": 1024.0, "step": 1.0}),
+                "outer_stability": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "fold_protection": ("BOOLEAN", {"default": True}),
+                "max_folded_area_percent": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 5.0, "step": 0.01}),
+                "background_threshold": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 0.5, "step": 0.001}),
+                "output_mask_mode": (GEOMETRY_ALIGN_MASK_MODES, {"default": "target"}),
+                "source_person_index": ("INT", {"default": -1, "min": -1, "max": 15, "step": 1}),
+                "target_person_index": ("INT", {"default": -1, "min": -1, "max": 15, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("PIXAL3D_HUMANOID_ALIGN_SETTINGS",)
+    RETURN_NAMES = ("settings",)
+    FUNCTION = "build"
+    CATEGORY = categoryFolder
+    DESCRIPTION = (
+        "Packages anatomy-aware alignment controls. Arms, legs, torso, head, hands "
+        "and feet have independent strengths; -1 selects the largest detected person."
+    )
+
+    def build(
+        self,
+        view,
+        global_model,
+        score_threshold,
+        global_alignment_strength,
+        torso_strength,
+        arm_strength,
+        leg_strength,
+        head_strength,
+        hand_strength,
+        foot_strength,
+        tps_regularization,
+        max_local_shift_pixels,
+        outer_stability,
+        fold_protection,
+        max_folded_area_percent,
+        background_threshold,
+        output_mask_mode,
+        source_person_index,
+        target_person_index,
+    ):
+        settings = HumanoidAlignSettings(
+            view=str(view),
+            global_model=str(global_model),
+            score_threshold=min(1.0, max(0.0, float(score_threshold))),
+            global_alignment_strength=min(1.0, max(0.0, float(global_alignment_strength))),
+            torso_strength=min(1.5, max(0.0, float(torso_strength))),
+            arm_strength=min(1.5, max(0.0, float(arm_strength))),
+            leg_strength=min(1.5, max(0.0, float(leg_strength))),
+            head_strength=min(1.5, max(0.0, float(head_strength))),
+            hand_strength=min(1.5, max(0.0, float(hand_strength))),
+            foot_strength=min(1.5, max(0.0, float(foot_strength))),
+            tps_regularization=max(1e-6, float(tps_regularization)),
+            max_local_shift_pixels=max(0.0, float(max_local_shift_pixels)),
+            outer_stability=min(1.0, max(0.0, float(outer_stability))),
+            fold_protection=bool(fold_protection),
+            max_folded_area_percent=min(5.0, max(0.0, float(max_folded_area_percent))),
+            background_threshold=min(1.0, max(0.0, float(background_threshold))),
+            output_mask_mode=str(output_mask_mode),
+            source_person_index=max(-1, int(source_person_index)),
+            target_person_index=max(-1, int(target_person_index)),
+        )
+        if settings.view not in VIEW_NAMES:
+            raise ValueError(f"Unknown humanoid align view: {settings.view!r}")
+        if settings.global_model not in HUMANOID_GLOBAL_MODELS:
+            raise ValueError(f"Unknown humanoid global model: {settings.global_model!r}")
+        if settings.output_mask_mode not in GEOMETRY_ALIGN_MASK_MODES:
+            raise ValueError(f"Unknown humanoid output mask mode: {settings.output_mask_mode!r}")
+        return (settings,)
+
+
+class Pixal3DHumanoidPoseReference:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "depth_map": ("IMAGE",),
+                "mesh_mask": ("MASK",),
+                "relief_strength": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 12.0, "step": 0.1}),
+                "edge_strength": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "background_level": ("FLOAT", {"default": 0.08, "min": 0.0, "max": 1.0, "step": 0.01}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("pose_reference",)
+    FUNCTION = "render"
+    CATEGORY = categoryFolder
+    DESCRIPTION = (
+        "Builds a neutral shaded character projection from Shape View Maps depth and "
+        "mesh mask. Feed it to a second SDPose Keypoint Extractor for target landmarks."
+    )
+
+    def render(self, depth_map, mesh_mask, relief_strength, edge_strength, background_level):
+        return (
+            make_humanoid_pose_reference(
+                depth_map,
+                mesh_mask,
+                float(relief_strength),
+                float(edge_strength),
+                float(background_level),
+            ),
+        )
+
+
+class Pixal3DSAM3DHumanoidPoseProjector:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mhr_pose_data": ("MHR_POSE_DATA",),
+                "target_mask": ("MASK",),
+                "source_view": (VIEW_NAMES, {"default": "front"}),
+                "target_view": (VIEW_NAMES, {"default": "left"}),
+                "skeleton_height_percent": ("FLOAT", {"default": 84.0, "min": 50.0, "max": 120.0, "step": 0.5}),
+                "horizontal_scale_percent": ("FLOAT", {"default": 100.0, "min": 25.0, "max": 200.0, "step": 1.0}),
+                "horizontal_offset_pixels": ("FLOAT", {"default": 0.0, "min": -1024.0, "max": 1024.0, "step": 1.0}),
+                "vertical_offset_pixels": ("FLOAT", {"default": 0.0, "min": -1024.0, "max": 1024.0, "step": 1.0}),
+                "mirror_side_projection": ("BOOLEAN", {"default": False}),
+                "include_hands": ("BOOLEAN", {"default": False}),
+                "person_index": ("INT", {"default": -1, "min": -1, "max": 15, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("POSE_KEYPOINT", "IMAGE", "STRING")
+    RETURN_NAMES = ("target_pose", "pose_preview", "report")
+    FUNCTION = "project"
+    CATEGORY = categoryFolder
+    DESCRIPTION = (
+        "Projects the complete 3D skeleton predicted from a real source view by "
+        "ComfyUI SAM3D Body into Front/Left/Right/Back and fits it to the target "
+        "mesh mask. This avoids running a 2D pose detector on a synthetic side render."
+    )
+
+    def project(
+        self,
+        mhr_pose_data,
+        target_mask,
+        source_view,
+        target_view,
+        skeleton_height_percent,
+        horizontal_scale_percent,
+        horizontal_offset_pixels,
+        vertical_offset_pixels,
+        mirror_side_projection,
+        include_hands,
+        person_index,
+    ):
+        result = project_sam3d_humanoid_pose(
+            mhr_pose_data,
+            target_mask,
+            source_view,
+            target_view,
+            float(skeleton_height_percent),
+            float(horizontal_scale_percent),
+            float(horizontal_offset_pixels),
+            float(vertical_offset_pixels),
+            bool(mirror_side_projection),
+            bool(include_hands),
+            int(person_index),
+        )
+        logging.info("%s", result[-1].replace("\n", " | "))
+        return result
+
+
+class Pixal3DHumanoidPoseViewAlign:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "source_pose": ("POSE_KEYPOINT",),
+                "target_reference": ("IMAGE",),
+                "target_pose": ("POSE_KEYPOINT",),
+                "settings": ("PIXAL3D_HUMANOID_ALIGN_SETTINGS",),
+            },
+            "optional": {
+                "source_mask": ("MASK",),
+                "target_mask": ("MASK",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "IMAGE", "IMAGE", "STRING")
+    RETURN_NAMES = (
+        "aligned_image",
+        "aligned_rgba",
+        "aligned_mask",
+        "deformation_preview",
+        "landmark_overlay",
+        "report",
+    )
+    FUNCTION = "align"
+    CATEGORY = categoryFolder
+    DESCRIPTION = (
+        "Character-specific view alignment driven by matching SDPose joints. It uses "
+        "anatomical correspondences for arms and legs instead of asking depth alone "
+        "to discover semantic parts. Use one instance per camera view."
+    )
+
+    def align(
+        self,
+        image,
+        source_pose,
+        target_reference,
+        target_pose,
+        settings,
+        source_mask=None,
+        target_mask=None,
+    ):
+        result = humanoid_pose_view_align(
+            image,
+            source_pose,
+            target_reference,
+            target_pose,
+            settings,
+            source_mask,
+            target_mask,
+        )
+        logging.info("%s", result[-1].replace("\n", " | "))
+        return result
 class Pixal3DShapeViewMaps:
     @classmethod
     def INPUT_TYPES(cls):
@@ -4197,8 +6299,6 @@ class PredictTrellis2ShapeSubdivides:
     FUNCTION = "predict"
     CATEGORY = categoryFolder
     DESCRIPTION = (
-
-
         "Runs the native TRELLIS.2 shape decoder only far enough to predict its four "
         "subdivision maps. Use these maps for VAE Decode Texture; the decoded shape "
         "mesh is deliberately not extracted and the Hunyuan geometry remains unchanged."
@@ -4285,6 +6385,9 @@ class Pixal3DReprojectionViewSettings:
                 "crop_right_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 95.0, "step": 0.5}),
                 "crop_top_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 95.0, "step": 0.5}),
                 "crop_bottom_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 95.0, "step": 0.5}),
+                "coverage_mode": (COVERAGE_MODES, {"default": "angular_sector"}),
+                "camera_feather_pixels": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 256.0, "step": 1.0}),
+                "camera_feather_inset_pixels": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 256.0, "step": 1.0}),
             }
         }
 
@@ -4295,7 +6398,9 @@ class Pixal3DReprojectionViewSettings:
     DESCRIPTION = (
         "Collects every camera-specific reprojection control into one compact pipeline. "
         "Connect it to the matching Front, Left, Right or Back settings input. "
-        "Independent L/R/T/B crops mask unwanted parts without rescaling the view."
+        "Independent L/R/T/B crops mask unwanted parts without rescaling the view. "
+        "all_camera_visible covers the complete z-buffer-visible camera silhouette; "
+        "camera feather inset and width control its transparent-to-opaque edge."
     )
 
     def build(
@@ -4315,6 +6420,9 @@ class Pixal3DReprojectionViewSettings:
         crop_right_percent=0.0,
         crop_top_percent=0.0,
         crop_bottom_percent=0.0,
+        coverage_mode="angular_sector",
+        camera_feather_pixels=0.0,
+        camera_feather_inset_pixels=0.0,
     ):
         crop_values = tuple(
             min(95.0, max(0.0, float(value)))
@@ -4345,6 +6453,11 @@ class Pixal3DReprojectionViewSettings:
             crop_right_percent=crop_values[1],
             crop_top_percent=crop_values[2],
             crop_bottom_percent=crop_values[3],
+            coverage_mode=str(coverage_mode),
+            camera_feather_pixels=max(0.0, float(camera_feather_pixels)),
+            camera_feather_inset_pixels=max(
+                0.0, float(camera_feather_inset_pixels)
+            ),
         )
         _validate_view_settings(settings, str(view))
         return (settings,)
@@ -4367,6 +6480,10 @@ class Pixal3DImageGuidedVoxelReprojection:
                 "visibility_tolerance_voxels": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 16.0, "step": 0.25}),
                 "generated_texture_strength_percent": ("FLOAT", {"default": 100.0, "min": 0.0, "max": 100.0, "step": 1.0}),
                 "uncovered_color": ("COLOR", {"default": "#808080"}),
+                "camera_composite_mode": (
+                    CAMERA_COMPOSITE_MODES,
+                    {"default": "ordered_layers"},
+                ),
             }
         }
 
@@ -4377,8 +6494,9 @@ class Pixal3DImageGuidedVoxelReprojection:
     DESCRIPTION = (
         "Projects high-resolution F/L/R/B RGB directly onto visible decoded voxels, "
         "while preserving Metallic, Roughness and all channels after RGB. Camera-specific "
-        "controls arrive through four compact settings pipelines. Layers are evaluated "
-        "from left to right in layer_order_bottom_to_top; the last view is the top layer."
+        "controls arrive through four compact settings pipelines. Use weighted_average "
+        "for normalized, order-independent seams or ordered_layers for Photoshop-style "
+        "bottom-to-top compositing."
     )
 
     def reproject(
@@ -4395,6 +6513,7 @@ class Pixal3DImageGuidedVoxelReprojection:
         visibility_tolerance_voxels,
         generated_texture_strength_percent=100.0,
         uncovered_color="#808080",
+        camera_composite_mode="ordered_layers",
     ):
         settings = tuple(
             _validate_view_settings(value, expected)
@@ -4425,6 +6544,14 @@ class Pixal3DImageGuidedVoxelReprojection:
             view_crop_right_percent=tuple(item.crop_right_percent for item in settings),
             view_crop_top_percent=tuple(item.crop_top_percent for item in settings),
             view_crop_bottom_percent=tuple(item.crop_bottom_percent for item in settings),
+            view_coverage_modes=tuple(item.coverage_mode for item in settings),
+            view_camera_feather_pixels=tuple(
+                item.camera_feather_pixels for item in settings
+            ),
+            view_camera_feather_inset_pixels=tuple(
+                item.camera_feather_inset_pixels for item in settings
+            ),
+            camera_composite_mode=str(camera_composite_mode),
         )
         logging.info("%s", result[3].replace("\n", " | "))
         return result
@@ -4606,6 +6733,12 @@ NODE_CLASS_MAPPINGS_3D = {
     "Trellis2ShapeEncoderLoader": Trellis2ShapeEncoderLoader,
     "Pixal3DFourViewConditioningHunyuan": Pixal3DFourViewConditioningHunyuan,
     "Pixal3DAutoAlignView": Pixal3DAutoAlignView,
+    "Pixal3DGeometryAlignSettings": Pixal3DGeometryAlignSettings,
+    "Pixal3DGeometryAwareViewAlign": Pixal3DGeometryAwareViewAlign,
+    "Pixal3DHumanoidAlignSettings": Pixal3DHumanoidAlignSettings,
+    "Pixal3DHumanoidPoseReference": Pixal3DHumanoidPoseReference,
+    "Pixal3DSAM3DHumanoidPoseProjector": Pixal3DSAM3DHumanoidPoseProjector,
+    "Pixal3DHumanoidPoseViewAlign": Pixal3DHumanoidPoseViewAlign,
     "Pixal3DShapeViewMaps": Pixal3DShapeViewMaps,
     "Pixal3DBatchFourViews": Pixal3DBatchFourViews,
     "Pixal3DAutoAlignFourViews": Pixal3DAutoAlignFourViews,
@@ -4633,6 +6766,12 @@ NODE_DISPLAY_NAME_MAPPINGS_3D = {
     "Trellis2ShapeEncoderLoader": "Load TRELLIS.2 External Mesh Encoder",
     "Pixal3DFourViewConditioningHunyuan": "Pixal3D 4-View Conditioning (Hunyuan)",
     "Pixal3DAutoAlignView": "Pixal3D Auto Align View",
+    "Pixal3DGeometryAlignSettings": "Pixal3D Geometry Align Settings",
+    "Pixal3DGeometryAwareViewAlign": "Pixal3D Geometry-Aware View Align",
+    "Pixal3DHumanoidAlignSettings": "Pixal3D Humanoid Align Settings",
+    "Pixal3DHumanoidPoseReference": "Pixal3D Humanoid Pose Reference",
+    "Pixal3DSAM3DHumanoidPoseProjector": "Pixal3D SAM3D Humanoid Pose Projector",
+    "Pixal3DHumanoidPoseViewAlign": "Pixal3D Humanoid Pose View Align",
     "Pixal3DShapeViewMaps": "Pixal3D Shape View Maps (Mask / Depth / Canny)",
     "Pixal3DBatchFourViews": "Pixal3D Batch 4 Views (F/L/R/B)",
     "Pixal3DAutoAlignFourViews": "Pixal3D Auto Align 4 Views (Legacy)",

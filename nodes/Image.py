@@ -4,6 +4,7 @@ from comfy import model_management
 from comfy import utils as comfy_utils
 from comfy.cli_args import args as comfy_args
 import numpy as np
+import cv2
 import kornia
 import torch
 import torchvision.transforms.functional as TF
@@ -15,7 +16,7 @@ import re
 import hashlib
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 from nodes import SaveImage
 from PIL.PngImagePlugin import PngInfo
 
@@ -46,6 +47,66 @@ def tensor2mask(t: torch.Tensor) -> torch.Tensor:
         if torch.min(t[:, :, :, 3]).item() != 1.:
             return t[:,:,:,3]
     return TF.rgb_to_grayscale(t.permute(0,3,1,2), num_output_channels=1)[:,0,:,:]
+
+
+class CP_ImageFromList:
+    INPUT_IS_LIST = True
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "start": ("INT", {"default": 0, "min": 0, "step": 1}),
+                "length": ("INT", {"default": -1, "min": -1, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "execute"
+    CATEGORY = categoryFolder
+
+    def execute(self, images, start, length):
+        if not images:
+            raise ValueError("Image From List received an empty image list")
+
+        start = int(start[0])
+        length = int(length[0])
+        start = min(start, len(images) - 1)
+        end = len(images) if length < 0 else min(len(images), start + length)
+        selected = images[start:end]
+
+        if not selected:
+            raise ValueError("Image From List selected an empty range")
+
+        batches = []
+        expected_shape = None
+        for list_index, image in enumerate(selected, start=start):
+            if not isinstance(image, torch.Tensor):
+                raise TypeError(
+                    f"Image From List item {list_index} is not a torch.Tensor"
+                )
+            if image.ndim == 3:
+                image = image.unsqueeze(0)
+            if image.ndim != 4:
+                raise ValueError(
+                    f"Image From List item {list_index} must have shape [B,H,W,C] "
+                    f"or [H,W,C], got {tuple(image.shape)}"
+                )
+
+            item_shape = tuple(image.shape[1:])
+            if expected_shape is None:
+                expected_shape = item_shape
+            elif item_shape != expected_shape:
+                raise ValueError(
+                    "Image From List cannot create a batch from images with different "
+                    f"sizes or channel counts: expected {expected_shape}, got "
+                    f"{item_shape} at list item {list_index}"
+                )
+            batches.append(image)
+
+        return (torch.cat(batches, dim=0),)
 
 
 #Crops an image by the specified number of pixels on each side. Zero values ​​are allowed for image overflow.
@@ -2805,7 +2866,1274 @@ class CP_CivitaiImageSave:
         return {"ui": {"images": results}}
 
 
+class AlignmentError(ValueError):
+    """Raised when a usable character or depth silhouette cannot be extracted."""
+
+
+class AlignOptions:
+    __slots__ = (
+        "depth_mode",
+        "depth_threshold",
+        "alpha_threshold",
+        "use_ecc",
+        "deformation_strength",
+        "edge_band_px",
+        "flow_smooth_sigma",
+        "max_flow_px",
+        "use_internal_alignment",
+        "internal_strength",
+        "internal_max_shift_px",
+        "feather_px",
+        "exact_target_alpha",
+        "max_analysis_size",
+    )
+
+    def __init__(
+        self,
+        depth_mode="auto",
+        depth_threshold=0.0,
+        alpha_threshold=8,
+        use_ecc=True,
+        deformation_strength=1.0,
+        edge_band_px=96.0,
+        flow_smooth_sigma=10.0,
+        max_flow_px=96.0,
+        use_internal_alignment=True,
+        internal_strength=0.7,
+        internal_max_shift_px=48.0,
+        feather_px=0.75,
+        exact_target_alpha=True,
+        max_analysis_size=1400,
+    ):
+        self.depth_mode = depth_mode
+        self.depth_threshold = depth_threshold
+        self.alpha_threshold = alpha_threshold
+        self.use_ecc = use_ecc
+        self.deformation_strength = deformation_strength
+        self.edge_band_px = edge_band_px
+        self.flow_smooth_sigma = flow_smooth_sigma
+        self.max_flow_px = max_flow_px
+        self.use_internal_alignment = use_internal_alignment
+        self.internal_strength = internal_strength
+        self.internal_max_shift_px = internal_max_shift_px
+        self.feather_px = feather_px
+        self.exact_target_alpha = exact_target_alpha
+        self.max_analysis_size = max_analysis_size
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any] | None) -> "AlignOptions":
+        value = value or {}
+        known = set(cls.__slots__)
+        filtered = {key: item for key, item in value.items() if key in known}
+        result = cls(**filtered)
+        if result.depth_mode not in {"auto", "light", "dark", "alpha"}:
+            raise AlignmentError(f"Unknown depth mode: {result.depth_mode}")
+        result.depth_threshold = float(np.clip(result.depth_threshold, 0.0, 255.0))
+        result.alpha_threshold = int(np.clip(result.alpha_threshold, 0, 254))
+        result.deformation_strength = float(np.clip(result.deformation_strength, 0.0, 2.0))
+        result.edge_band_px = max(1.0, float(result.edge_band_px))
+        result.flow_smooth_sigma = max(0.0, float(result.flow_smooth_sigma))
+        result.max_flow_px = max(0.0, float(result.max_flow_px))
+        result.use_internal_alignment = bool(result.use_internal_alignment)
+        result.internal_strength = float(np.clip(result.internal_strength, 0.0, 1.5))
+        result.internal_max_shift_px = max(0.0, float(result.internal_max_shift_px))
+        result.feather_px = max(0.0, float(result.feather_px))
+        result.max_analysis_size = int(np.clip(result.max_analysis_size, 256, 4096))
+        return result
+
+
+def decode_png(payload: bytes) -> np.ndarray:
+    image = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise AlignmentError("OpenCV could not decode the PNG payload")
+    return image
+
+
+def encode_png(image: np.ndarray) -> bytes:
+    ok, encoded = cv2.imencode(".png", image, [cv2.IMWRITE_PNG_COMPRESSION, 4])
+    if not ok:
+        raise AlignmentError("OpenCV could not encode the result PNG")
+    return encoded.tobytes()
+
+
+def _as_bgra(image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGRA)
+    if image.shape[2] == 4:
+        return image
+    if image.shape[2] == 3:
+        return cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
+    raise AlignmentError(f"Unsupported channel count: {image.shape[2]}")
+
+
+def _to_gray(image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        return image
+    if image.shape[2] == 4:
+        return cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+    return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+
+def _remove_tiny_components(mask: np.ndarray) -> np.ndarray:
+    binary = (mask > 0).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if count <= 2:
+        return binary
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest = int(areas.max(initial=0))
+    minimum = max(4, int(largest * 0.00025))
+    keep = np.zeros(count, dtype=np.uint8)
+    keep[1:] = (areas >= minimum).astype(np.uint8)
+    return keep[labels]
+
+
+def extract_source_mask(source_bgra: np.ndarray, alpha_threshold: int) -> np.ndarray:
+    alpha = source_bgra[:, :, 3]
+    if int(alpha.max()) <= alpha_threshold:
+        raise AlignmentError("The character layer has no visible alpha silhouette")
+    mask = _remove_tiny_components((alpha > alpha_threshold).astype(np.uint8))
+    if int(mask.sum()) < 16:
+        raise AlignmentError("The character alpha silhouette is empty")
+    return mask
+
+
+def _border_values(gray: np.ndarray) -> np.ndarray:
+    height, width = gray.shape
+    strip = max(2, min(height, width) // 100)
+    return np.concatenate(
+        (
+            gray[:strip, :].reshape(-1),
+            gray[-strip:, :].reshape(-1),
+            gray[:, :strip].reshape(-1),
+            gray[:, -strip:].reshape(-1),
+        )
+    )
+
+
+def _otsu_threshold(gray: np.ndarray) -> float:
+    threshold, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    return float(threshold)
+
+
+def extract_depth_mask(depth: np.ndarray, options: AlignOptions) -> tuple[np.ndarray, dict[str, float | str]]:
+    bgra = _as_bgra(depth)
+    gray = _to_gray(depth)
+    alpha = bgra[:, :, 3]
+    mode = options.depth_mode
+    threshold = options.depth_threshold
+
+    if mode == "alpha":
+        effective = threshold if threshold > 0 else 1.0
+        mask = alpha > effective
+        background = 0.0
+    elif mode == "light":
+        effective = threshold if threshold > 0 else _otsu_threshold(gray)
+        mask = gray > effective
+        background = float(np.median(_border_values(gray)))
+    elif mode == "dark":
+        effective = threshold if threshold > 0 else _otsu_threshold(gray)
+        mask = gray < effective
+        background = float(np.median(_border_values(gray)))
+    else:
+        background = float(np.median(_border_values(gray)))
+        delta = cv2.absdiff(gray, np.full_like(gray, int(round(background))))
+        effective = threshold if threshold > 0 else max(2.0, _otsu_threshold(delta))
+        mask = delta > effective
+
+    cleaned = _remove_tiny_components(mask.astype(np.uint8))
+    area = int(cleaned.sum())
+    image_area = cleaned.shape[0] * cleaned.shape[1]
+    if area < 16:
+        raise AlignmentError("No foreground was found in the depth layer; try another depth mode or threshold")
+    if area > image_area * 0.98:
+        raise AlignmentError("Almost the entire depth layer became foreground; try another depth mode or threshold")
+    return cleaned, {
+        "depth_mode": mode,
+        "depth_threshold_used": round(float(effective), 3),
+        "depth_background": round(background, 3),
+    }
+
+
+def _mask_bbox(mask: np.ndarray) -> tuple[float, float, float, float]:
+    points = cv2.findNonZero(mask.astype(np.uint8))
+    if points is None:
+        raise AlignmentError("Cannot calculate bounds for an empty silhouette")
+    x, y, width, height = cv2.boundingRect(points)
+    return float(x), float(y), float(width), float(height)
+
+
+def _initial_inverse_affine(source_mask: np.ndarray, target_mask: np.ndarray) -> np.ndarray:
+    sx, sy, sw, sh = _mask_bbox(source_mask)
+    tx, ty, tw, th = _mask_bbox(target_mask)
+    scale_x = sw / max(tw, 1.0)
+    scale_y = sh / max(th, 1.0)
+    source_center_x = sx + sw * 0.5
+    source_center_y = sy + sh * 0.5
+    target_center_x = tx + tw * 0.5
+    target_center_y = ty + th * 0.5
+    return np.array(
+        [
+            [scale_x, 0.0, source_center_x - scale_x * target_center_x],
+            [0.0, scale_y, source_center_y - scale_y * target_center_y],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _refine_inverse_affine_ecc(
+    source_mask: np.ndarray,
+    target_mask: np.ndarray,
+    initial: np.ndarray,
+    max_analysis_size: int,
+) -> tuple[np.ndarray, bool, float | None]:
+    height, width = target_mask.shape
+    scale = min(1.0, max_analysis_size / max(height, width))
+    if scale < 1.0:
+        analysis_size = (max(32, int(round(width * scale))), max(32, int(round(height * scale))))
+        source_small = cv2.resize(source_mask, analysis_size, interpolation=cv2.INTER_AREA)
+        target_small = cv2.resize(target_mask, analysis_size, interpolation=cv2.INTER_AREA)
+    else:
+        source_small = source_mask
+        target_small = target_mask
+
+    warp = initial.copy()
+    warp[:, 2] *= scale
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 80, 1e-6)
+    try:
+        correlation, warp = cv2.findTransformECC(
+            target_small.astype(np.float32),
+            source_small.astype(np.float32),
+            warp,
+            cv2.MOTION_AFFINE,
+            criteria,
+            None,
+            5,
+        )
+        warp[:, 2] /= scale
+        return warp.astype(np.float32), True, float(correlation)
+    except cv2.error:
+        return initial, False, None
+
+
+def _signed_distance(mask: np.ndarray) -> np.ndarray:
+    binary = (mask > 0).astype(np.uint8)
+    inside = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    outside = cv2.distanceTransform(1 - binary, cv2.DIST_L2, 5)
+    return inside - outside
+
+
+def _sample_contours(mask: np.ndarray, max_points: int) -> np.ndarray:
+    contours, _ = cv2.findContours(
+        (mask > 0).astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_NONE,
+    )
+    contours = [item[:, 0, :].astype(np.float32) for item in contours if len(item) >= 4]
+    if not contours:
+        raise AlignmentError("Cannot sample an empty contour")
+    lengths = np.array([len(item) for item in contours], dtype=np.float64)
+    allocations = np.maximum(4, np.round(max_points * lengths / lengths.sum()).astype(int))
+    sampled: list[np.ndarray] = []
+    for contour, count in zip(contours, allocations, strict=True):
+        count = min(int(count), len(contour))
+        indices = np.linspace(0, len(contour), count, endpoint=False, dtype=np.int32)
+        sampled.append(contour[indices])
+    points = np.concatenate(sampled, axis=0)
+    if len(points) > max_points:
+        indices = np.linspace(0, len(points), max_points, endpoint=False, dtype=np.int32)
+        points = points[indices]
+    return points.astype(np.float32)
+
+
+def _nearest_points(query: np.ndarray, candidates: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    # The matrices stay small (roughly 220 x 1400), so a vectorized nearest
+    # lookup is both faster and more predictable than adding another dependency.
+    squared = np.sum((query[:, None, :] - candidates[None, :, :]) ** 2, axis=2)
+    indices = np.argmin(squared, axis=1)
+    return candidates[indices], np.sqrt(squared[np.arange(len(query)), indices])
+
+
+def _stable_anchor_points(target_mask: np.ndarray, edge_band_px: float) -> np.ndarray:
+    height, width = target_mask.shape
+    anchors: list[tuple[float, float]] = [
+        (0.0, 0.0),
+        (width - 1.0, 0.0),
+        (0.0, height - 1.0),
+        (width - 1.0, height - 1.0),
+        ((width - 1.0) * 0.5, 0.0),
+        ((width - 1.0) * 0.5, height - 1.0),
+        (0.0, (height - 1.0) * 0.5),
+        (width - 1.0, (height - 1.0) * 0.5),
+    ]
+    inside_distance = cv2.distanceTransform((target_mask > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    spacing = int(np.clip(edge_band_px, 32.0, 160.0))
+    required_depth = max(8.0, edge_band_px * 0.55)
+    for y in range(spacing // 2, height, spacing):
+        for x in range(spacing // 2, width, spacing):
+            if inside_distance[y, x] >= required_depth:
+                anchors.append((float(x), float(y)))
+    moments = cv2.moments(target_mask.astype(np.uint8))
+    if moments["m00"] > 0:
+        centroid = (moments["m10"] / moments["m00"], moments["m01"] / moments["m00"])
+        anchors.append((float(centroid[0]), float(centroid[1])))
+    return np.unique(np.round(np.array(anchors, dtype=np.float32), 3), axis=0)
+
+
+def _tps_kernel(squared_distance: np.ndarray) -> np.ndarray:
+    return squared_distance * np.log(squared_distance + 1e-12)
+
+
+def _fit_tps(
+    control_points: np.ndarray,
+    displacements: np.ndarray,
+    width: int,
+    height: int,
+    regularization: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    center = np.array([(width - 1.0) * 0.5, (height - 1.0) * 0.5], dtype=np.float64)
+    coordinate_scale = float(max(width, height, 1))
+    points = (control_points.astype(np.float64) - center) / coordinate_scale
+    delta = points[:, None, :] - points[None, :, :]
+    kernel = _tps_kernel(np.sum(delta * delta, axis=2))
+    kernel += np.eye(len(points), dtype=np.float64) * regularization
+    affine = np.column_stack((np.ones(len(points)), points))
+    system = np.block(
+        [
+            [kernel, affine],
+            [affine.T, np.zeros((3, 3), dtype=np.float64)],
+        ]
+    )
+    right = np.vstack((displacements.astype(np.float64), np.zeros((3, 2), dtype=np.float64)))
+    try:
+        coefficients = np.linalg.solve(system, right)
+    except np.linalg.LinAlgError:
+        coefficients = np.linalg.lstsq(system, right, rcond=1e-8)[0]
+    return points, coefficients[:-3], coefficients[-3:], coordinate_scale
+
+
+def _evaluate_tps_flow(
+    control_points_normalized: np.ndarray,
+    weights: np.ndarray,
+    affine: np.ndarray,
+    coordinate_scale: float,
+    width: int,
+    height: int,
+    max_analysis_size: int,
+) -> np.ndarray:
+    longest = max(width, height)
+    # The field is intrinsically smooth, so a roughly 640 px analysis grid is
+    # enough even for 4K input and avoids evaluating millions of TPS samples.
+    evaluation_limit = min(max_analysis_size, 640)
+    step = max(1, int(np.ceil(longest / evaluation_limit)))
+    evaluation_width = int(np.ceil((width - 1) / step)) + 1
+    evaluation_height = int(np.ceil((height - 1) / step)) + 1
+    xs = np.linspace(0.0, width - 1.0, evaluation_width, dtype=np.float64)
+    ys = np.linspace(0.0, height - 1.0, evaluation_height, dtype=np.float64)
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    pixels = np.column_stack((grid_x.reshape(-1), grid_y.reshape(-1)))
+    center = np.array([(width - 1.0) * 0.5, (height - 1.0) * 0.5], dtype=np.float64)
+    normalized = (pixels - center) / coordinate_scale
+
+    evaluated = np.empty((len(normalized), 2), dtype=np.float64)
+    chunk_size = 8192
+    for start in range(0, len(normalized), chunk_size):
+        chunk = normalized[start : start + chunk_size]
+        delta = chunk[:, None, :] - control_points_normalized[None, :, :]
+        kernel = _tps_kernel(np.sum(delta * delta, axis=2))
+        evaluated[start : start + chunk_size] = (
+            kernel @ weights + np.column_stack((np.ones(len(chunk)), chunk)) @ affine
+        )
+    flow = evaluated.reshape(evaluation_height, evaluation_width, 2).astype(np.float32)
+    if step > 1:
+        flow = cv2.resize(flow, (width, height), interpolation=cv2.INTER_CUBIC)
+    return flow
+
+
+def _calculate_regularized_flow(
+    target_mask: np.ndarray,
+    aligned_mask: np.ndarray,
+    options: AlignOptions,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    height, width = target_mask.shape
+    target_points = _sample_contours(target_mask, 220)
+    source_candidates = _sample_contours(aligned_mask, 1400)
+    source_matches, match_distance = _nearest_points(target_points, source_candidates)
+
+    displacements = source_matches - target_points
+    displacement_magnitude = np.linalg.norm(displacements, axis=1)
+    allowed_match = max(8.0, options.max_flow_px * 1.5) if options.max_flow_px > 0 else np.inf
+    valid = match_distance <= allowed_match
+    target_points = target_points[valid]
+    displacements = displacements[valid]
+    displacement_magnitude = displacement_magnitude[valid]
+    if len(target_points) < 6:
+        raise AlignmentError("Too few reliable contour correspondences for local deformation")
+    if options.max_flow_px > 0:
+        limiter = np.minimum(1.0, options.max_flow_px / np.maximum(displacement_magnitude, 1e-6))
+        displacements *= limiter[:, None]
+
+    anchors = _stable_anchor_points(target_mask, options.edge_band_px)
+    control_points = np.vstack((target_points, anchors)).astype(np.float32)
+    control_displacements = np.vstack(
+        (displacements, np.zeros((len(anchors), 2), dtype=np.float32))
+    )
+    normalized_points, weights, affine, coordinate_scale = _fit_tps(
+        control_points,
+        control_displacements,
+        width,
+        height,
+        regularization=0.0025,
+    )
+    flow = _evaluate_tps_flow(
+        normalized_points,
+        weights,
+        affine,
+        coordinate_scale,
+        width,
+        height,
+        options.max_analysis_size,
+    )
+
+    sigma = options.flow_smooth_sigma
+    if sigma > 0:
+        flow[:, :, 0] = cv2.GaussianBlur(flow[:, :, 0], (0, 0), sigmaX=sigma, sigmaY=sigma)
+        flow[:, :, 1] = cv2.GaussianBlur(flow[:, :, 1], (0, 0), sigmaX=sigma, sigmaY=sigma)
+
+    magnitude = np.linalg.norm(flow, axis=2)
+    if options.max_flow_px > 0:
+        limiter = np.minimum(1.0, options.max_flow_px / np.maximum(magnitude, 1e-6))
+        flow *= limiter[:, :, None]
+
+    target_distance = np.abs(_signed_distance(target_mask))
+    edge_weight = np.exp(-target_distance / options.edge_band_px).astype(np.float32)
+    edge_weight = np.maximum(edge_weight, 0.08 * target_mask.astype(np.float32))
+    flow *= (edge_weight * options.deformation_strength)[:, :, None]
+    return flow, edge_weight, len(control_points)
+
+
+def _gradient_field(
+    image: np.ndarray,
+    use_color: bool,
+    blur_sigma: float = 1.35,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return edge magnitude and a normal direction for multimodal matching."""
+    if use_color:
+        bgr = image[:, :, :3] if image.ndim == 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        channels = cv2.split(cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32) / 255.0)
+    else:
+        channels = (_to_gray(image).astype(np.float32) / 255.0,)
+
+    x_gradients: list[np.ndarray] = []
+    y_gradients: list[np.ndarray] = []
+    magnitudes: list[np.ndarray] = []
+    for channel in channels:
+        smooth = cv2.GaussianBlur(channel, (0, 0), sigmaX=blur_sigma, sigmaY=blur_sigma)
+        gradient_x = cv2.Sobel(smooth, cv2.CV_32F, 1, 0, ksize=3)
+        gradient_y = cv2.Sobel(smooth, cv2.CV_32F, 0, 1, ksize=3)
+        x_gradients.append(gradient_x)
+        y_gradients.append(gradient_y)
+        magnitudes.append(cv2.magnitude(gradient_x, gradient_y))
+
+    magnitude_stack = np.stack(magnitudes, axis=2)
+    strongest_channel = np.argmax(magnitude_stack, axis=2)
+    gradient_x = np.take_along_axis(
+        np.stack(x_gradients, axis=2), strongest_channel[:, :, None], axis=2
+    )[:, :, 0]
+    gradient_y = np.take_along_axis(
+        np.stack(y_gradients, axis=2), strongest_channel[:, :, None], axis=2
+    )[:, :, 0]
+    magnitude = np.take_along_axis(
+        magnitude_stack, strongest_channel[:, :, None], axis=2
+    )[:, :, 0]
+    return magnitude, gradient_x, gradient_y
+
+
+def _sample_strong_edges(
+    magnitude: np.ndarray,
+    gradient_x: np.ndarray,
+    gradient_y: np.ndarray,
+    valid_mask: np.ndarray,
+    max_points: int,
+    percentile: float,
+    spacing: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    valid = (valid_mask > 0) & np.isfinite(magnitude) & (magnitude > 1e-5)
+    values = magnitude[valid]
+    if len(values) < 12:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
+
+    threshold = max(1e-4, float(np.percentile(values, percentile)))
+    candidates = np.argwhere(valid & (magnitude >= threshold))
+    if len(candidates) == 0:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
+
+    strengths = magnitude[candidates[:, 0], candidates[:, 1]]
+    order = np.argsort(strengths)[::-1]
+    blocked = np.zeros(magnitude.shape, dtype=np.uint8)
+    selected: list[tuple[float, float]] = []
+    normals: list[tuple[float, float]] = []
+    for candidate_index in order:
+        y, x = candidates[candidate_index]
+        if blocked[y, x]:
+            continue
+        edge_magnitude = float(magnitude[y, x])
+        selected.append((float(x), float(y)))
+        normals.append(
+            (
+                float(gradient_x[y, x]) / edge_magnitude,
+                float(gradient_y[y, x]) / edge_magnitude,
+            )
+        )
+        cv2.circle(blocked, (int(x), int(y)), spacing, 1, -1)
+        if len(selected) >= max_points:
+            break
+
+    return np.asarray(selected, dtype=np.float32), np.asarray(normals, dtype=np.float32)
+
+
+def _strong_edge_mask(
+    magnitude: np.ndarray,
+    valid_mask: np.ndarray,
+    percentile: float,
+) -> np.ndarray:
+    valid = (valid_mask > 0) & np.isfinite(magnitude) & (magnitude > 1e-5)
+    values = magnitude[valid]
+    if len(values) < 12:
+        return np.zeros(magnitude.shape, dtype=np.uint8)
+    threshold = max(1e-4, float(np.percentile(values, percentile)))
+    # Keep the ridge of a blurred edge instead of its entire several-pixel
+    # gradient band. Otherwise matching stops at the near side of that band and
+    # systematically underestimates a limb translation.
+    local_maximum = cv2.dilate(magnitude, np.ones((3, 3), dtype=np.uint8))
+    ridge = magnitude >= (local_maximum - 1e-6)
+    edges = (valid & (magnitude >= threshold) & ridge).astype(np.uint8)
+    if int(edges.sum()) < 12:
+        edges = (valid & (magnitude >= threshold)).astype(np.uint8)
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    return cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+
+
+def _cluster_depth_centers(gray: np.ndarray, mask: np.ndarray, cluster_count: int = 4) -> np.ndarray:
+    values = gray[mask > 0].astype(np.float32)
+    unique = np.unique(values)
+    if len(unique) < 2:
+        return unique
+    count = min(cluster_count, len(unique))
+    percentiles = np.linspace(0.0, 100.0, count + 2, dtype=np.float32)[1:-1]
+    centers = np.percentile(values, percentiles).astype(np.float32)
+    bins = np.arange(256, dtype=np.float32)
+    histogram = np.bincount(values.astype(np.uint8), minlength=256).astype(np.float64)
+    for _ in range(16):
+        assignment = np.argmin(np.abs(bins[:, None] - centers[None, :]), axis=1)
+        updated = centers.copy()
+        for index in range(count):
+            weights = histogram[assignment == index]
+            selected_bins = bins[assignment == index]
+            if float(weights.sum()) > 0:
+                updated[index] = float(np.average(selected_bins, weights=weights))
+        if np.max(np.abs(updated - centers)) < 0.05:
+            centers = updated
+            break
+        centers = updated
+    return np.unique(np.round(np.sort(centers), 3))
+
+
+def _extract_near_depth_edges(
+    depth: np.ndarray,
+    target_mask: np.ndarray,
+    valid_mask: np.ndarray,
+) -> tuple[np.ndarray, int, list[float]]:
+    """Extract coherent bright/near regions instead of arbitrary depth texture."""
+    gray_source = _to_gray(depth)
+    if gray_source.dtype == np.uint8:
+        gray = gray_source
+    else:
+        gray = cv2.normalize(gray_source, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    centers = _cluster_depth_centers(gray, target_mask)
+    empty = np.zeros(target_mask.shape, dtype=np.uint8)
+    if len(centers) < 2:
+        return empty, 0, []
+
+    silhouette_area = max(1, int((target_mask > 0).sum()))
+    gaps = np.diff(centers)
+    candidate_boundaries = np.argsort(gaps)[::-1]
+    combined_boundary = np.zeros_like(empty)
+    selected_thresholds: list[float] = []
+    kept_count = 0
+    minimum_area = max(20, int(round(silhouette_area * 0.0015)))
+    maximum_area = int(round(silhouette_area * 0.35))
+    close_kernel = np.ones((5, 5), dtype=np.uint8)
+    open_kernel = np.ones((3, 3), dtype=np.uint8)
+
+    # A single threshold often isolates only the face. Keep the useful regions
+    # from every significant depth band so a separate near arm remains a
+    # candidate; the translation matcher below will reject already aligned
+    # regions and unrelated texture.
+    for boundary_index in candidate_boundaries:
+        threshold = float((centers[boundary_index] + centers[boundary_index + 1]) * 0.5)
+        region = ((gray >= threshold) & (target_mask > 0)).astype(np.uint8)
+        ratio = float(region.sum()) / silhouette_area
+        if not 0.003 <= ratio <= 0.65:
+            continue
+
+        region = cv2.morphologyEx(region, cv2.MORPH_CLOSE, close_kernel)
+        region = cv2.morphologyEx(region, cv2.MORPH_OPEN, open_kernel)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(region, connectivity=8)
+        kept = np.zeros_like(region)
+        threshold_component_count = 0
+        for label in range(1, count):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if minimum_area <= area <= maximum_area:
+                kept[labels == label] = 1
+                threshold_component_count += 1
+        if threshold_component_count == 0:
+            continue
+
+        eroded = cv2.erode(kept, open_kernel)
+        boundary = ((kept > 0) & (eroded == 0) & (valid_mask > 0)).astype(np.uint8)
+        boundary = cv2.morphologyEx(boundary, cv2.MORPH_CLOSE, open_kernel)
+        if int(boundary.sum()) < 12:
+            continue
+        combined_boundary = np.maximum(combined_boundary, boundary)
+        kept_count += threshold_component_count
+        selected_thresholds.append(round(threshold, 3))
+
+    return combined_boundary, kept_count, selected_thresholds
+
+
+def _sample_component_points(component: np.ndarray, max_points: int) -> np.ndarray:
+    contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return np.empty((0, 2), dtype=np.float32)
+    contour = max(contours, key=len)[:, 0, :].astype(np.float32)
+    if len(contour) > max_points:
+        indices = np.linspace(0, len(contour), max_points, endpoint=False, dtype=np.int32)
+        contour = contour[indices]
+    return contour
+
+
+def _match_depth_edge_components(
+    target_edges: np.ndarray,
+    source_edges: np.ndarray,
+    max_shift: float,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Match complete depth-edge fragments by chamfer distance under translation."""
+    if max_shift <= 0 or int(target_edges.sum()) < 12 or int(source_edges.sum()) < 12:
+        empty = np.empty((0, 2), dtype=np.float32)
+        return empty, empty.copy(), 0
+
+    source_support = cv2.dilate(source_edges.astype(np.uint8), np.ones((3, 3), np.uint8))
+    source_distance = cv2.distanceTransform(1 - source_support, cv2.DIST_L2, 5).astype(np.float32)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        target_edges.astype(np.uint8), connectivity=8
+    )
+    component_order = sorted(
+        range(1, count),
+        key=lambda label: int(stats[label, cv2.CC_STAT_AREA]),
+        reverse=True,
+    )
+
+    height, width = target_edges.shape
+    radius = max(1, int(np.ceil(max_shift)))
+    matched_points: list[np.ndarray] = []
+    matched_displacements: list[np.ndarray] = []
+    accepted_components = 0
+    for label in component_order[:20]:
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < 12:
+            continue
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        component_width = int(stats[label, cv2.CC_STAT_WIDTH])
+        component_height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        component = (labels == label).astype(np.uint8)
+        template = component[y : y + component_height, x : x + component_width].astype(np.float32)
+        edge_count = float(template.sum())
+        if edge_count < 12:
+            continue
+
+        roi_x0 = max(0, x - radius)
+        roi_y0 = max(0, y - radius)
+        roi_x1 = min(width, x + component_width + radius)
+        roi_y1 = min(height, y + component_height + radius)
+        search = source_distance[roi_y0:roi_y1, roi_x0:roi_x1]
+        if search.shape[0] < component_height or search.shape[1] < component_width:
+            continue
+        response = cv2.matchTemplate(search, template, cv2.TM_CCORR) / edge_count
+
+        candidate_y, candidate_x = np.indices(response.shape, dtype=np.float32)
+        displacement_x = candidate_x + float(roi_x0 - x)
+        displacement_y = candidate_y + float(roi_y0 - y)
+        displacement_length = np.hypot(displacement_x, displacement_y)
+        # Prefer the nearest plausible translation. A large user search radius
+        # must not make a far-away facial feature look like a valid match.
+        objective = response + 0.04 * displacement_length
+        objective[displacement_length > max_shift] = np.inf
+        best_flat = int(np.argmin(objective))
+        best_y, best_x = np.unravel_index(best_flat, objective.shape)
+        if not np.isfinite(objective[best_y, best_x]):
+            continue
+
+        zero_x = x - roi_x0
+        zero_y = y - roi_y0
+        if not (0 <= zero_x < response.shape[1] and 0 <= zero_y < response.shape[0]):
+            continue
+        zero_score = float(response[zero_y, zero_x])
+        best_score = float(response[best_y, best_x])
+        shift = np.array(
+            [displacement_x[best_y, best_x], displacement_y[best_y, best_x]],
+            dtype=np.float32,
+        )
+        shift_length = float(np.linalg.norm(shift))
+        improvement = zero_score - best_score
+        required_improvement = max(0.75, zero_score * 0.15)
+        maximum_residual = min(7.5, max(3.5, max_shift * 0.08))
+        if (
+            shift_length < 0.75
+            or improvement < required_improvement
+            or best_score > maximum_residual
+        ):
+            continue
+
+        points = _sample_component_points(component, max_points=48)
+        if len(points) < 4:
+            continue
+        matched_points.append(points)
+        matched_displacements.append(np.repeat(shift[None, :], len(points), axis=0))
+        accepted_components += 1
+
+    if not matched_points:
+        empty = np.empty((0, 2), dtype=np.float32)
+        return empty, empty.copy(), 0
+    return (
+        np.vstack(matched_points).astype(np.float32),
+        np.vstack(matched_displacements).astype(np.float32),
+        accepted_components,
+    )
+
+
+def _match_internal_edges(
+    target_points: np.ndarray,
+    target_normals: np.ndarray,
+    source_points: np.ndarray,
+    source_normals: np.ndarray,
+    max_shift: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    if len(target_points) == 0 or len(source_points) == 0 or max_shift <= 0:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
+
+    delta = source_points[None, :, :] - target_points[:, None, :]
+    distance = np.linalg.norm(delta, axis=2)
+    orientation = np.abs(target_normals @ source_normals.T)
+    score = distance * (1.0 + 1.25 * (1.0 - orientation))
+    allowed = (distance <= max_shift) & (orientation >= 0.58)
+    score[~allowed] = np.inf
+
+    source_index = np.argmin(score, axis=1)
+    best_score = score[np.arange(len(target_points)), source_index]
+    reverse_target_index = np.argmin(score, axis=0)
+    mutual = reverse_target_index[source_index] == np.arange(len(target_points))
+    valid = np.isfinite(best_score) & mutual
+    matched_targets = target_points[valid]
+    displacement = source_points[source_index[valid]] - matched_targets
+    displacement_length = np.linalg.norm(displacement, axis=1)
+    moving = displacement_length >= 0.75
+    matched_targets = matched_targets[moving]
+    displacement = displacement[moving]
+
+    if len(matched_targets) >= 8:
+        point_distance = np.linalg.norm(
+            matched_targets[:, None, :] - matched_targets[None, :, :], axis=2
+        )
+        coherent = np.ones(len(matched_targets), dtype=bool)
+        neighborhood_radius = max(14.0, max_shift * 0.8)
+        tolerance = max(4.0, max_shift * 0.4)
+        for index in range(len(matched_targets)):
+            neighbors = point_distance[index] <= neighborhood_radius
+            if int(neighbors.sum()) >= 3:
+                local_median = np.median(displacement[neighbors], axis=0)
+                coherent[index] = np.linalg.norm(displacement[index] - local_median) <= tolerance
+        matched_targets = matched_targets[coherent]
+        displacement = displacement[coherent]
+
+    return matched_targets.astype(np.float32), displacement.astype(np.float32)
+
+
+def _calculate_internal_flow(
+    warped: np.ndarray,
+    warped_mask: np.ndarray,
+    depth: np.ndarray,
+    target_mask: np.ndarray,
+    options: AlignOptions,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    height, width = target_mask.shape
+    empty_flow = np.zeros((height, width, 2), dtype=np.float32)
+    empty_metrics: dict[str, Any] = {
+        "internal_alignment_used": False,
+        "internal_match_count": 0,
+        "internal_component_count": 0,
+        "internal_depth_region_count": 0,
+        "internal_depth_thresholds": [],
+        "internal_target_edge_count": 0,
+        "internal_source_edge_count": 0,
+        "internal_mean_flow_px": 0.0,
+        "internal_max_flow_px": 0.0,
+    }
+    if not options.use_internal_alignment or options.internal_max_shift_px <= 0:
+        return empty_flow, empty_metrics
+
+    source_bgr, _ = _unpremultiply_bgr(warped)
+    analysis_scale = min(1.0, options.max_analysis_size / max(height, width))
+    if analysis_scale < 1.0:
+        analysis_size = (
+            max(32, int(round(width * analysis_scale))),
+            max(32, int(round(height * analysis_scale))),
+        )
+        source_analysis = cv2.resize(source_bgr, analysis_size, interpolation=cv2.INTER_AREA)
+        depth_analysis = cv2.resize(depth, analysis_size, interpolation=cv2.INTER_AREA)
+        source_mask_analysis = cv2.resize(
+            warped_mask.astype(np.uint8), analysis_size, interpolation=cv2.INTER_NEAREST
+        )
+        target_mask_analysis = cv2.resize(
+            target_mask.astype(np.uint8), analysis_size, interpolation=cv2.INTER_NEAREST
+        )
+    else:
+        source_analysis = source_bgr
+        depth_analysis = depth
+        source_mask_analysis = warped_mask
+        target_mask_analysis = target_mask
+
+    source_magnitude, _, _ = _gradient_field(
+        source_analysis, use_color=True, blur_sigma=2.4
+    )
+
+    target_inside_analysis = cv2.distanceTransform(
+        (target_mask_analysis > 0).astype(np.uint8), cv2.DIST_L2, 5
+    )
+    source_inside_analysis = cv2.distanceTransform(
+        (source_mask_analysis > 0).astype(np.uint8), cv2.DIST_L2, 5
+    )
+    outer_exclusion = max(
+        2.0,
+        min(10.0, options.internal_max_shift_px * 0.15) * analysis_scale,
+    )
+    target_valid = target_inside_analysis >= outer_exclusion
+    source_valid = source_inside_analysis >= outer_exclusion
+
+    target_edge_mask, depth_region_count, depth_thresholds = _extract_near_depth_edges(
+        depth_analysis,
+        target_mask_analysis,
+        target_valid,
+    )
+    source_edge_mask = _strong_edge_mask(source_magnitude, source_valid, percentile=80.0)
+    component_points, component_displacement, component_count = _match_depth_edge_components(
+        target_edge_mask,
+        source_edge_mask,
+        max(2.0, options.internal_max_shift_px * analysis_scale),
+    )
+    # Do not fall back to independent edge-point matches here. They are easily
+    # attracted to eyes, mouth and hair and can bend a face even when no arm
+    # correspondence was found.
+    matched_points = component_points
+    displacement = component_displacement
+    if analysis_scale < 1.0:
+        matched_points /= analysis_scale
+        displacement /= analysis_scale
+    if len(matched_points) < 6:
+        empty_metrics["internal_target_edge_count"] = int(target_edge_mask.sum())
+        empty_metrics["internal_source_edge_count"] = int(source_edge_mask.sum())
+        empty_metrics["internal_component_count"] = int(component_count)
+        empty_metrics["internal_depth_region_count"] = int(depth_region_count)
+        empty_metrics["internal_depth_thresholds"] = depth_thresholds
+        return empty_flow, empty_metrics
+
+    boundary_points = _sample_contours(target_mask, 120)
+    control_points = np.vstack((matched_points, boundary_points)).astype(np.float32)
+    control_displacements = np.vstack(
+        (displacement, np.zeros((len(boundary_points), 2), dtype=np.float32))
+    )
+    normalized_points, weights, affine, coordinate_scale = _fit_tps(
+        control_points,
+        control_displacements,
+        width,
+        height,
+        regularization=0.012,
+    )
+    flow = _evaluate_tps_flow(
+        normalized_points,
+        weights,
+        affine,
+        coordinate_scale,
+        width,
+        height,
+        options.max_analysis_size,
+    )
+
+    matched_edge_mask = np.zeros((height, width), dtype=np.uint8)
+    for x, y in matched_points:
+        cv2.circle(matched_edge_mask, (int(round(x)), int(round(y))), 2, 1, -1)
+    distance_to_match = cv2.distanceTransform(1 - matched_edge_mask, cv2.DIST_L2, 5)
+    influence_radius = max(12.0, min(96.0, options.internal_max_shift_px * 1.35))
+    support = np.exp(-0.5 * (distance_to_match / influence_radius) ** 2).astype(np.float32)
+    target_inside = cv2.distanceTransform((target_mask > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    boundary_lock_width = max(6.0, min(24.0, influence_radius * 0.28))
+    boundary_lock = np.clip(target_inside / boundary_lock_width, 0.0, 1.0).astype(np.float32)
+    boundary_lock = boundary_lock * boundary_lock * (3.0 - 2.0 * boundary_lock)
+    flow *= (
+        support
+        * boundary_lock
+        * (target_mask > 0).astype(np.float32)
+        * options.internal_strength
+    )[:, :, None]
+
+    smooth_sigma = max(0.8, min(5.0, influence_radius * 0.06))
+    flow[:, :, 0] = cv2.GaussianBlur(flow[:, :, 0], (0, 0), smooth_sigma)
+    flow[:, :, 1] = cv2.GaussianBlur(flow[:, :, 1], (0, 0), smooth_sigma)
+    magnitude = np.linalg.norm(flow, axis=2)
+    limiter = np.minimum(
+        1.0,
+        options.internal_max_shift_px / np.maximum(magnitude, 1e-6),
+    )
+    flow *= limiter[:, :, None]
+    magnitude = np.linalg.norm(flow, axis=2)
+    inside = target_mask > 0
+    metrics: dict[str, Any] = {
+        "internal_alignment_used": True,
+        "internal_match_count": int(len(matched_points)),
+        "internal_target_edge_count": int(target_edge_mask.sum()),
+        "internal_source_edge_count": int(source_edge_mask.sum()),
+        "internal_component_count": int(component_count),
+        "internal_depth_region_count": int(depth_region_count),
+        "internal_depth_thresholds": depth_thresholds,
+        "internal_mean_flow_px": round(float(magnitude[inside].mean()), 4),
+        "internal_max_flow_px": round(float(magnitude.max(initial=0.0)), 4),
+    }
+    return flow, metrics
+
+
+def _iou(first: np.ndarray, second: np.ndarray) -> float:
+    first_bool = first > 0
+    second_bool = second > 0
+    union = np.logical_or(first_bool, second_bool).sum()
+    if union == 0:
+        return 1.0
+    return float(np.logical_and(first_bool, second_bool).sum() / union)
+
+
+def _premultiplied_bgra(source_bgra: np.ndarray) -> np.ndarray:
+    result = source_bgra.astype(np.float32) / 255.0
+    result[:, :, :3] *= result[:, :, 3:4]
+    return result
+
+
+def _unpremultiply_bgr(premultiplied: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    alpha = np.clip(premultiplied[:, :, 3], 0.0, 1.0)
+    denominator = np.maximum(alpha[:, :, None], 1e-4)
+    bgr = np.clip(premultiplied[:, :, :3] / denominator, 0.0, 1.0)
+    return (bgr * 255.0 + 0.5).astype(np.uint8), alpha
+
+
+def align_character_to_depth(
+    source: np.ndarray,
+    depth: np.ndarray,
+    raw_options: dict[str, Any] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    options = AlignOptions.from_mapping(raw_options)
+    source_bgra = _as_bgra(source)
+    if source_bgra.shape[:2] != depth.shape[:2]:
+        raise AlignmentError(
+            f"Layer sizes differ: character={source_bgra.shape[1]}x{source_bgra.shape[0]}, "
+            f"depth={depth.shape[1]}x{depth.shape[0]}"
+        )
+
+    source_mask = extract_source_mask(source_bgra, options.alpha_threshold)
+    target_mask, depth_metrics = extract_depth_mask(depth, options)
+    height, width = source_mask.shape
+
+    inverse_affine = _initial_inverse_affine(source_mask, target_mask)
+    ecc_used = False
+    ecc_correlation: float | None = None
+    if options.use_ecc:
+        inverse_affine, ecc_used, ecc_correlation = _refine_inverse_affine_ecc(
+            source_mask,
+            target_mask,
+            inverse_affine,
+            options.max_analysis_size,
+        )
+
+    premultiplied = _premultiplied_bgra(source_bgra)
+    affine_flags = cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP
+    aligned = cv2.warpAffine(
+        premultiplied,
+        inverse_affine,
+        (width, height),
+        flags=affine_flags,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0.0, 0.0, 0.0, 0.0),
+    )
+    aligned_mask = cv2.warpAffine(
+        source_mask,
+        inverse_affine,
+        (width, height),
+        flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+    flow, edge_weight, control_point_count = _calculate_regularized_flow(
+        target_mask, aligned_mask, options
+    )
+    grid_x, grid_y = np.meshgrid(
+        np.arange(width, dtype=np.float32),
+        np.arange(height, dtype=np.float32),
+    )
+    map_x = grid_x + flow[:, :, 0]
+    map_y = grid_y + flow[:, :, 1]
+    warped = cv2.remap(
+        aligned,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0.0, 0.0, 0.0, 0.0),
+    )
+    warped_mask = cv2.remap(
+        aligned_mask,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+    internal_flow, internal_metrics = _calculate_internal_flow(
+        warped,
+        warped_mask,
+        depth,
+        target_mask,
+        options,
+    )
+    if internal_metrics["internal_alignment_used"]:
+        internal_map_x = grid_x + internal_flow[:, :, 0]
+        internal_map_y = grid_y + internal_flow[:, :, 1]
+        warped = cv2.remap(
+            warped,
+            internal_map_x,
+            internal_map_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0.0, 0.0, 0.0, 0.0),
+        )
+        warped_mask = cv2.remap(
+            warped_mask,
+            internal_map_x,
+            internal_map_y,
+            interpolation=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
+    bgr, warped_alpha = _unpremultiply_bgr(warped)
+    missing = ((target_mask > 0) & (warped_alpha < 0.05)).astype(np.uint8) * 255
+    if int(missing.sum()) > 0:
+        bgr = cv2.inpaint(bgr, missing, 3.0, cv2.INPAINT_TELEA)
+
+    if options.exact_target_alpha:
+        output_alpha = target_mask.astype(np.float32) * 255.0
+    else:
+        output_alpha = np.clip(warped_alpha * 255.0, 0.0, 255.0)
+    if options.feather_px > 0:
+        output_alpha = cv2.GaussianBlur(
+            output_alpha,
+            (0, 0),
+            sigmaX=options.feather_px,
+            sigmaY=options.feather_px,
+        )
+    result = np.dstack((bgr, np.clip(output_alpha, 0.0, 255.0).astype(np.uint8)))
+
+    magnitude = np.linalg.norm(flow, axis=2)
+    metrics: dict[str, Any] = {
+        **depth_metrics,
+        "width": width,
+        "height": height,
+        "source_area": int(source_mask.sum()),
+        "target_area": int(target_mask.sum()),
+        "affine_iou": round(_iou(aligned_mask, target_mask), 5),
+        "warped_iou_before_exact_alpha": round(_iou(warped_mask, target_mask), 5),
+        "ecc_used": ecc_used,
+        "ecc_correlation": None if ecc_correlation is None else round(ecc_correlation, 6),
+        "mean_flow_px": round(float(magnitude[target_mask > 0].mean()), 4),
+        "max_flow_px": round(float(magnitude.max(initial=0.0)), 4),
+        "mean_edge_weight": round(float(edge_weight[target_mask > 0].mean()), 4),
+        "control_point_count": control_point_count,
+        "filled_pixel_count": int((missing > 0).sum()),
+        **internal_metrics,
+    }
+    return result, metrics
+
+class CP_DepthContourAligner:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "character_image": ("IMAGE",),
+                "depth_image": ("IMAGE",),
+                "depth_mode": (["auto", "light", "dark", "alpha"], {"default": "auto"}),
+                "depth_threshold": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "max": 255.0, "step": 1.0},
+                ),
+                "alpha_threshold": (
+                    "INT",
+                    {"default": 8, "min": 0, "max": 254, "step": 1},
+                ),
+                "use_ecc": ("BOOLEAN", {"default": True}),
+                "deformation_strength": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05},
+                ),
+                "edge_band_px": (
+                    "FLOAT",
+                    {"default": 96.0, "min": 1.0, "max": 4096.0, "step": 1.0},
+                ),
+                "flow_smooth_sigma": (
+                    "FLOAT",
+                    {"default": 10.0, "min": 0.0, "max": 4096.0, "step": 0.25},
+                ),
+                "max_flow_px": (
+                    "FLOAT",
+                    {"default": 96.0, "min": 0.0, "max": 4096.0, "step": 1.0},
+                ),
+                "use_internal_alignment": ("BOOLEAN", {"default": True}),
+                "internal_strength": (
+                    "FLOAT",
+                    {"default": 0.7, "min": 0.0, "max": 1.5, "step": 0.05},
+                ),
+                "internal_max_shift_px": (
+                    "FLOAT",
+                    {"default": 48.0, "min": 0.0, "max": 4096.0, "step": 1.0},
+                ),
+                "feather_px": (
+                    "FLOAT",
+                    {"default": 0.75, "min": 0.0, "max": 4096.0, "step": 0.05},
+                ),
+                "exact_target_alpha": ("BOOLEAN", {"default": True}),
+                "max_analysis_size": (
+                    "INT",
+                    {"default": 1400, "min": 256, "max": 4096, "step": 16},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE")
+    RETURN_NAMES = ("aligned_rgba", "aligned_on_black")
+    FUNCTION = "align"
+    CATEGORY = categoryFolder
+
+    @staticmethod
+    def _tensor_frame_to_opencv(frame: torch.Tensor) -> np.ndarray:
+        array = frame.detach().cpu().numpy()
+        array = np.clip(np.rint(array * 255.0), 0, 255).astype(np.uint8)
+        if array.ndim == 2:
+            return np.ascontiguousarray(array)
+        if array.ndim != 3:
+            raise AlignmentError(f"Unsupported image dimensions: {array.shape}")
+
+        channels = array.shape[2]
+        if channels == 1:
+            return np.ascontiguousarray(array[:, :, 0])
+        if channels == 3:
+            return cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+        if channels == 4:
+            return cv2.cvtColor(array, cv2.COLOR_RGBA2BGRA)
+        raise AlignmentError(f"Unsupported channel count: {channels}")
+
+    @staticmethod
+    def _result_to_tensors(result_bgra: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+        rgba = cv2.cvtColor(result_bgra, cv2.COLOR_BGRA2RGBA)
+        rgba = np.ascontiguousarray(rgba.astype(np.float32) / 255.0)
+        on_black = np.ascontiguousarray(rgba[:, :, :3] * rgba[:, :, 3:4])
+        return torch.from_numpy(rgba), torch.from_numpy(on_black)
+
+    def align(
+        self,
+        character_image,
+        depth_image,
+        depth_mode,
+        depth_threshold,
+        alpha_threshold,
+        use_ecc,
+        deformation_strength,
+        edge_band_px,
+        flow_smooth_sigma,
+        max_flow_px,
+        use_internal_alignment,
+        internal_strength,
+        internal_max_shift_px,
+        feather_px,
+        exact_target_alpha,
+        max_analysis_size,
+    ):
+        character_count = int(character_image.shape[0])
+        depth_count = int(depth_image.shape[0])
+        if character_count < 1 or depth_count < 1:
+            raise ValueError("Depth Contour Aligner requires non-empty image inputs.")
+        if (
+            character_count != depth_count
+            and character_count != 1
+            and depth_count != 1
+        ):
+            raise ValueError(
+                "Depth Contour Aligner batch sizes must match, or one input batch "
+                f"must contain one image (character={character_count}, depth={depth_count})."
+            )
+
+        options = {
+            "depth_mode": depth_mode,
+            "depth_threshold": depth_threshold,
+            "alpha_threshold": alpha_threshold,
+            "use_ecc": use_ecc,
+            "deformation_strength": deformation_strength,
+            "edge_band_px": edge_band_px,
+            "flow_smooth_sigma": flow_smooth_sigma,
+            "max_flow_px": max_flow_px,
+            "use_internal_alignment": use_internal_alignment,
+            "internal_strength": internal_strength,
+            "internal_max_shift_px": internal_max_shift_px,
+            "feather_px": feather_px,
+            "exact_target_alpha": exact_target_alpha,
+            "max_analysis_size": max_analysis_size,
+        }
+
+        rgba_results = []
+        black_results = []
+        batch_count = max(character_count, depth_count)
+        for batch_index in range(batch_count):
+            character_frame = character_image[0 if character_count == 1 else batch_index]
+            depth_frame = depth_image[0 if depth_count == 1 else batch_index]
+            character_cv = self._tensor_frame_to_opencv(character_frame)
+            depth_cv = self._tensor_frame_to_opencv(depth_frame)
+            try:
+                result_bgra, _ = align_character_to_depth(
+                    character_cv,
+                    depth_cv,
+                    options,
+                )
+            except AlignmentError as error:
+                raise ValueError(
+                    f"Depth Contour Aligner failed on batch item {batch_index}: {error}"
+                ) from error
+
+            rgba_tensor, black_tensor = self._result_to_tensors(result_bgra)
+            rgba_results.append(rgba_tensor)
+            black_results.append(black_tensor)
+
+        return torch.stack(rgba_results, dim=0), torch.stack(black_results, dim=0)
+
+
 NODE_CLASS_MAPPINGS_IMAGE = {
+    "CP ImageFromList": CP_ImageFromList,
+    "CP DepthContourAligner": CP_DepthContourAligner,
     "CP ImageCropper": CP_ImageCrop,
     "CP ImageConcatMask": CP_ImageConcatMask,
     "CP FlipImagePair": CP_FlipImagePair,
@@ -2824,6 +4152,8 @@ NODE_CLASS_MAPPINGS_IMAGE = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS_IMAGE = {
+    "CP ImageFromList": "Image from list",
+    "CP DepthContourAligner": "Depth Contour Aligner",
     "CP ImageCropper": "Image crop",
     "CP ImageConcatMask": "Image concat mask",
     "CP FlipImagePair": "Flip image pair",
